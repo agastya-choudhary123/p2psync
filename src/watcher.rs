@@ -5,7 +5,7 @@
 use anyhow::Result;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -26,14 +26,6 @@ pub enum FsEvent {
     /// File created or modified — read it and diff.
     Touched(PathBuf),
     Removed(PathBuf),
-}
-
-/// Should this path participate in sync?
-pub fn ignored(rel: &Path) -> bool {
-    rel.components().any(|c| {
-        let s = c.as_os_str().to_string_lossy();
-        s == ".p2psync" || s == ".git" || s == ".DS_Store" || s.ends_with(".swp") || s.starts_with(".#")
-    })
 }
 
 /// Spawn a watcher thread over `root`. Returns the receiver of debounced events

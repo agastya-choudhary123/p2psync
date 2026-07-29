@@ -22,6 +22,7 @@ fn spawn_peer(root: PathBuf, id: u64, port: u16, peers: Vec<String>) {
         tls: false,
         discovery: false,
         verbose: false,
+        secret: None,
     };
     tokio::spawn(async move {
         let _ = Engine::run(cfg).await;
@@ -170,7 +171,7 @@ fn bench_bandwidth() {
     let frame = wire::encode(&Msg::BinaryDelta {
         path: "image.bin".into(),
         hash: binary::sha256_hex(&blob),
-        mtime_ms: 0,
+        version: 1,
         ops,
     })
     .unwrap();

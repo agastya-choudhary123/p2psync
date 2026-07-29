@@ -18,11 +18,37 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 /// agnostic.
 pub enum Stream {
     Plain(TcpStream),
-    ServerTls(Box<tokio_rustls::server::TlsStream<TcpStream>>),
+    ServerTls(Box<tokio_rustls::server::TlsStream<TcpStream>>, [u8; 32]),
     ClientTls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
 }
 
+/// SHA-256 of a DER-encoded certificate.
+pub fn fingerprint(der: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(der);
+    h.finalize().into()
+}
+
 impl Stream {
+    /// SHA-256 of the listener's TLS certificate, for authentication channel
+    /// binding. `None` over plaintext, where there is nothing to bind to.
+    pub fn channel_binding(&self) -> Option<[u8; 32]> {
+        match self {
+            Stream::Plain(_) => None,
+            // We are the listener: bind to the certificate we presented.
+            Stream::ServerTls(_, fp) => Some(*fp),
+            // We dialed: bind to the certificate we were shown. A MITM must
+            // present its own here, which is exactly what we want to detect.
+            Stream::ClientTls(s) => {
+                let (_, conn) = s.get_ref();
+                conn.peer_certificates()
+                    .and_then(|certs| certs.first())
+                    .map(|cert| fingerprint(cert.as_ref()))
+            }
+        }
+    }
+
     pub fn split(
         self,
     ) -> (
@@ -34,7 +60,7 @@ impl Stream {
                 let (r, w) = tokio::io::split(s);
                 (Box::new(r), Box::new(w))
             }
-            Stream::ServerTls(s) => {
+            Stream::ServerTls(s, _) => {
                 let (r, w) = tokio::io::split(*s);
                 (Box::new(r), Box::new(w))
             }
@@ -50,15 +76,19 @@ impl Stream {
 pub struct Tls {
     acceptor: TlsAcceptor,
     connector: TlsConnector,
+    /// SHA-256 of our own certificate, used as the channel binding when we are
+    /// the listener (the dialing side derives the same value from the
+    /// certificate it was presented).
+    own_fingerprint: [u8; 32],
 }
 
 /// Accepts any certificate.
 ///
-/// MVP posture: TLS here buys confidentiality and integrity on the wire
-/// against a passive observer, not authentication — an active MITM on the
-/// path could impersonate a peer. Real deployments want pinned certificate
-/// fingerprints or a shared CA; that is called out in the README rather than
-/// papered over here.
+/// Certificates are self-signed and ephemeral, so validating a chain would be
+/// meaningless. Peer identity comes from the authentication handshake instead:
+/// with `--secret`, both sides prove knowledge of a shared key bound to *this*
+/// certificate, which is what rules out an active MITM (see `crate::auth`).
+/// Without a secret, TLS protects only against a passive observer.
 #[derive(Debug)]
 struct AcceptAny;
 
@@ -105,6 +135,7 @@ impl Tls {
         let cert = rcgen::generate_simple_self_signed(vec!["p2psync.local".to_string()])
             .context("generating self-signed certificate")?;
         let cert_der = CertificateDer::from(cert.cert.der().to_vec());
+        let own_fingerprint = fingerprint(cert_der.as_ref());
         let key_der = PrivateKeyDer::try_from(cert.key_pair.serialize_der())
             .map_err(|e| anyhow::anyhow!("serializing key: {e}"))?;
 
@@ -122,6 +153,7 @@ impl Tls {
         Ok(Self {
             acceptor: TlsAcceptor::from(Arc::new(server)),
             connector: TlsConnector::from(Arc::new(client)),
+            own_fingerprint,
         })
     }
 }
@@ -130,7 +162,10 @@ pub async fn accept(tcp: TcpStream, tls: Option<&Tls>) -> Result<Stream> {
     tcp.set_nodelay(true)?;
     match tls {
         None => Ok(Stream::Plain(tcp)),
-        Some(t) => Ok(Stream::ServerTls(Box::new(t.acceptor.accept(tcp).await?))),
+        Some(t) => Ok(Stream::ServerTls(
+            Box::new(t.acceptor.accept(tcp).await?),
+            t.own_fingerprint,
+        )),
     }
 }
 

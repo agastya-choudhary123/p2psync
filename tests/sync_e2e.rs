@@ -14,6 +14,7 @@ fn spawn_peer(root: PathBuf, id: u64, port: u16, peers: Vec<String>) {
         tls: false,
         discovery: false,
         verbose: false,
+        secret: None,
     };
     tokio::spawn(async move {
         if let Err(e) = Engine::run(cfg).await {
@@ -248,6 +249,7 @@ async fn tls_link_syncs() {
             tls: true,
             discovery: false,
             verbose: false,
+            secret: None,
         };
         tokio::spawn(async move {
             let _ = Engine::run(cfg).await;

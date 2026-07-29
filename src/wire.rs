@@ -17,8 +17,42 @@ pub const BLOCK_SIZE: usize = 4096;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Msg {
-    /// First frame on every connection.
-    Hello { peer_id: PeerId, name: String },
+    /// First frame on every connection. The nonce feeds the authentication
+    /// handshake; `authenticated` lets a peer say it expects one, so a
+    /// misconfigured pair fails loudly instead of syncing unprotected.
+    Hello {
+        peer_id: PeerId,
+        name: String,
+        #[serde(with = "serde_bytes")]
+        nonce: Vec<u8>,
+        authenticated: bool,
+    },
+
+    /// Proof of the shared secret; see `crate::auth`.
+    Auth {
+        #[serde(with = "serde_bytes")]
+        mac: Vec<u8>,
+    },
+
+    /// What we have, so the peer can ask only for what it's missing. Sent on
+    /// connect in place of a full snapshot per file.
+    Manifest {
+        text: Vec<TextDigest>,
+        bin: Vec<BinDigest>,
+    },
+
+    /// "Send me the full CRDT state for these paths."
+    SnapshotRequest { paths: Vec<String> },
+
+    /// A compacted replacement document: same visible text, tombstones dropped,
+    /// new content-derived lineage. Adopted only by peers whose text already
+    /// matches `text_hash`.
+    Checkpoint {
+        path: String,
+        elems: Vec<Elem>,
+        base: PeerId,
+        text_hash: String,
+    },
 
     /// Streaming CRDT operations for one text file.
     Ops {
@@ -48,8 +82,9 @@ pub enum Msg {
         path: String,
         hash: String,
         len: u64,
-        /// Millis since epoch, for last-writer-wins.
-        mtime_ms: u64,
+        /// Logical (Lamport) version, not a timestamp: last-writer-wins on a
+        /// wall clock picks the wrong winner whenever machine clocks disagree.
+        version: u64,
     },
 
     /// "I have a different version; here are my block signatures — send me a
@@ -65,9 +100,30 @@ pub enum Msg {
     BinaryDelta {
         path: String,
         hash: String,
-        mtime_ms: u64,
+        version: u64,
         ops: Vec<DeltaOp>,
     },
+}
+
+/// One text file's identity in a `Manifest`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TextDigest {
+    pub path: String,
+    /// SHA-256 of the visible text.
+    pub hash: String,
+    pub base: PeerId,
+    /// Stored elements vs. visible characters, so peers can agree on when a
+    /// document is worth compacting.
+    pub tombstones: u64,
+}
+
+/// One binary file's identity in a `Manifest`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BinDigest {
+    pub path: String,
+    pub hash: String,
+    pub len: u64,
+    pub version: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

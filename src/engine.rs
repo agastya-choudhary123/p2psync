@@ -4,12 +4,14 @@
 //! CRDT documents: filesystem events, peer messages, and timer ticks all
 //! funnel into one `Event` channel and are handled sequentially.
 
+use crate::auth::{self, Role};
 use crate::binary;
-use crate::crdt::{Doc, Op, PeerId};
+use crate::crdt::{self, Doc, Op, PeerId};
 use crate::diff;
+use crate::ignore::Ignore;
 use crate::net::{self, Stream, Tls};
 use crate::watcher::{self, FsEvent};
-use crate::wire::{self, read_msg, write_msg, DeltaOp, Msg, BLOCK_SIZE};
+use crate::wire::{self, read_msg, write_msg, BinDigest, DeltaOp, Msg, TextDigest, BLOCK_SIZE};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -35,6 +37,25 @@ pub struct Config {
     pub tls: bool,
     pub discovery: bool,
     pub verbose: bool,
+    /// Pre-shared key. When set, peers must prove knowledge of it to sync.
+    pub secret: Option<Vec<u8>>,
+}
+
+/// Compact a document once it is this bloated with tombstones, and no sooner.
+/// Overridable so the test suite doesn't have to generate 4096 deletions.
+fn compaction_threshold() -> usize {
+    std::env::var("P2PSYNC_COMPACT_AFTER")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4096)
+}
+
+/// How often to consider compacting. Overridable for the same reason.
+fn compaction_interval() -> Duration {
+    match std::env::var("P2PSYNC_COMPACT_EVERY_MS").ok().and_then(|v| v.parse().ok()) {
+        Some(ms) => Duration::from_millis(ms),
+        None => Duration::from_secs(30),
+    }
 }
 
 /// A text file's CRDT document plus the lineage of its id space.
@@ -50,18 +71,27 @@ struct TextEntry {
 struct BinEntry {
     hash: String,
     len: u64,
-    mtime_ms: u64,
+    /// Lamport version for last-writer-wins, immune to clock skew.
+    version: u64,
 }
 
 #[derive(Default, Serialize, Deserialize)]
 struct State {
     text: HashMap<String, TextEntry>,
     bin: HashMap<String, BinEntry>,
+    /// Every peer we have ever talked to. Compaction waits for all of them,
+    /// because changing a document's lineage while a peer is away would
+    /// demote that peer's offline edits to last-writer-wins on return.
+    #[serde(default)]
+    known_peers: std::collections::HashSet<PeerId>,
 }
 
 struct PeerConn {
     name: String,
     tx: mpsc::UnboundedSender<Msg>,
+    /// Latest (hash, base) this peer reported per text path, from its manifest.
+    /// Compaction only proceeds when every connected peer agrees with us.
+    digests: HashMap<String, (String, PeerId)>,
 }
 
 enum Event {
@@ -97,6 +127,8 @@ pub struct Engine {
     /// When we last printed a throughput line, and the counts at that point.
     last_stats: Instant,
     reported: (u64, u64),
+    ignore: Ignore,
+    last_compaction_check: Instant,
 }
 
 fn now_ms() -> u64 {
@@ -133,6 +165,8 @@ impl Engine {
             ops_recv: 0,
             last_stats: Instant::now(),
             reported: (0, 0),
+            ignore: Ignore::load(&cfg.root),
+            last_compaction_check: Instant::now(),
             cfg,
         };
         engine.load_state();
@@ -168,6 +202,7 @@ impl Engine {
             let tx = ev_tx.clone();
             let tls = tls.clone();
             let me = (engine.cfg.peer_id, engine.cfg.name.clone());
+            let listen_secret = engine.cfg.secret.clone();
             tokio::spawn(async move {
                 loop {
                     match listener.accept().await {
@@ -175,10 +210,22 @@ impl Engine {
                             let tx = tx.clone();
                             let tls = tls.clone();
                             let me = me.clone();
+                            let secret = listen_secret.clone();
                             tokio::spawn(async move {
                                 match net::accept(tcp, tls.as_ref()).await {
                                     Ok(s) => {
-                                        let _ = pump(s, me, tx, peer_addr.to_string()).await;
+                                        if let Err(e) = pump(
+                                            s,
+                                            me,
+                                            tx,
+                                            peer_addr.to_string(),
+                                            Role::Responder,
+                                            secret,
+                                        )
+                                        .await
+                                        {
+                                            eprintln!("[net] {peer_addr}: {e:#}");
+                                        }
                                     }
                                     Err(e) => eprintln!("[net] accept failed: {e}"),
                                 }
@@ -202,6 +249,7 @@ impl Engine {
                 tls.clone(),
                 ev_tx.clone(),
                 engine.live_addrs.clone(),
+                engine.cfg.secret.clone(),
             );
         }
 
@@ -214,9 +262,17 @@ impl Engine {
                     let live = engine.live_addrs.clone();
                     let tls = tls.clone();
                     let ev = ev_tx.clone();
+                    let secret = engine.cfg.secret.clone();
                     tokio::spawn(async move {
                         while let Some(addr) = addr_rx.recv().await {
-                            spawn_dialer(addr, me.clone(), tls.clone(), ev.clone(), live.clone());
+                            spawn_dialer(
+                                addr,
+                                me.clone(),
+                                tls.clone(),
+                                ev.clone(),
+                                live.clone(),
+                                secret.clone(),
+                            );
                         }
                     });
                 }
@@ -267,7 +323,17 @@ impl Engine {
                     return Ok(()); // duplicate link (both sides dialed)
                 }
                 println!("[peer] + {} \"{}\" via {}", format_id(peer_id), name, addr);
-                self.peers.insert(peer_id, PeerConn { name, tx });
+                if self.state.known_peers.insert(peer_id) {
+                    self.dirty = true;
+                }
+                self.peers.insert(
+                    peer_id,
+                    PeerConn {
+                        name,
+                        tx,
+                        digests: HashMap::new(),
+                    },
+                );
                 self.send_catchup(peer_id);
                 Ok(())
             }
@@ -282,6 +348,7 @@ impl Engine {
                 self.flush_pending_deletes();
                 self.prune_self_writes();
                 self.report_stats();
+                self.maybe_compact();
                 Ok(())
             }
         }
@@ -312,10 +379,11 @@ impl Engine {
 
     fn rel(&self, path: &Path) -> Option<String> {
         let rel = path.strip_prefix(&self.cfg.root).ok()?;
-        if watcher::ignored(rel) {
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        if rel.is_empty() || self.ignore.is_ignored(&rel) {
             return None;
         }
-        Some(rel.to_string_lossy().replace('\\', "/"))
+        Some(rel)
     }
 
     fn on_touched(&mut self, path: &Path) -> Result<()> {
@@ -332,7 +400,7 @@ impl Engine {
         }
 
         if binary::is_binary(&bytes) {
-            return self.on_local_binary(rel, path, bytes, hash);
+            return self.on_local_binary(rel, bytes, hash);
         }
         let text = String::from_utf8_lossy(&bytes).to_string();
 
@@ -362,12 +430,13 @@ impl Engine {
 
         match self.state.text.get_mut(&rel) {
             None => {
-                // New text file: build a document and ship the whole thing.
-                let (doc, _) = Doc::from_text(self.cfg.peer_id, &text);
-                let entry = TextEntry {
-                    doc,
-                    base: self.cfg.peer_id,
-                };
+                // New text file. Derive the character ids from the content
+                // itself, so a peer that already holds these exact bytes builds
+                // an identical document and the two merge as a real CRDT
+                // instead of colliding as unrelated histories.
+                let (mut doc, base) = Doc::from_shared_content(&rel, &text);
+                doc.set_peer(self.cfg.peer_id);
+                let entry = TextEntry { doc, base };
                 let snap = Msg::Snapshot {
                     path: rel.clone(),
                     elems: entry.doc.snapshot(),
@@ -406,15 +475,17 @@ impl Engine {
         Ok(())
     }
 
-    fn on_local_binary(&mut self, rel: String, path: &Path, bytes: Vec<u8>, hash: String) -> Result<()> {
+    fn on_local_binary(&mut self, rel: String, bytes: Vec<u8>, hash: String) -> Result<()> {
         if self.state.bin.get(&rel).map(|b| b.hash.as_str()) == Some(hash.as_str()) {
             return Ok(());
         }
         let is_new = !self.state.bin.contains_key(&rel);
+        // Bump the logical clock past anything we've seen for this path.
+        let version = self.state.bin.get(&rel).map(|b| b.version).unwrap_or(0) + 1;
         let entry = BinEntry {
             hash: hash.clone(),
             len: bytes.len() as u64,
-            mtime_ms: mtime_ms(path),
+            version,
         };
         println!("[sync] binary {rel} ({} bytes, {})", entry.len, &hash[..8]);
         if is_new {
@@ -424,7 +495,7 @@ impl Engine {
             path: rel.clone(),
             hash,
             len: entry.len,
-            mtime_ms: entry.mtime_ms,
+            version: entry.version,
         };
         self.state.bin.insert(rel, entry);
         self.dirty = true;
@@ -474,7 +545,12 @@ impl Engine {
 
     fn on_msg(&mut self, from: PeerId, msg: Msg) -> Result<()> {
         match msg {
-            Msg::Hello { .. } => Ok(()),
+            Msg::Hello { .. } | Msg::Auth { .. } => Ok(()), // handled during handshake
+            Msg::Manifest { text, bin } => self.on_manifest(from, text, bin),
+            Msg::SnapshotRequest { paths } => self.on_snapshot_request(from, paths),
+            Msg::Checkpoint { path, elems, base, text_hash } => {
+                self.on_checkpoint(from, path, elems, base, text_hash)
+            }
             Msg::FileCreate { .. } => Ok(()), // the Snapshot/BinaryMeta carries the content
             Msg::Ops { path, ops, base } => self.on_ops(from, path, ops, base),
             Msg::Snapshot { path, elems, text_hash, base, mtime_ms } => {
@@ -512,14 +588,14 @@ impl Engine {
                 self.broadcast(Msg::FileRename { from: old, to }, Some(from));
                 Ok(())
             }
-            Msg::BinaryMeta { path, hash, len, mtime_ms } => {
-                self.on_binary_meta(from, path, hash, len, mtime_ms)
+            Msg::BinaryMeta { path, hash, len, version } => {
+                self.on_binary_meta(from, path, hash, len, version)
             }
             Msg::BinarySignatures { path, block_size, sigs } => {
                 self.on_binary_signatures(from, path, block_size, sigs)
             }
-            Msg::BinaryDelta { path, hash, mtime_ms, ops } => {
-                self.on_binary_delta(from, path, hash, mtime_ms, ops)
+            Msg::BinaryDelta { path, hash, version, ops } => {
+                self.on_binary_delta(from, path, hash, version, ops)
             }
         }
     }
@@ -688,13 +764,20 @@ impl Engine {
         Ok(())
     }
 
-    fn on_binary_meta(&mut self, from: PeerId, path: String, hash: String, _len: u64, mtime_ms: u64) -> Result<()> {
+    fn on_binary_meta(&mut self, from: PeerId, path: String, hash: String, _len: u64, version: u64) -> Result<()> {
         if let Some(local) = self.state.bin.get(&path) {
             if local.hash == hash {
+                // Same bytes: just keep the logical clock monotonic.
+                if version > local.version {
+                    let mut e = local.clone();
+                    e.version = version;
+                    self.state.bin.insert(path, e);
+                    self.dirty = true;
+                }
                 return Ok(());
             }
-            // Last-writer-wins: only pull if their copy is newer than ours.
-            if (local.mtime_ms, self.cfg.peer_id) > (mtime_ms, from) {
+            // Last-writer-wins on the logical clock, peer id as the tiebreak.
+            if (local.version, self.cfg.peer_id) > (version, from) {
                 return Ok(());
             }
         }
@@ -742,12 +825,13 @@ impl Engine {
             data.len(),
             ops.iter().filter(|o| matches!(o, DeltaOp::CopyBlock(_))).count()
         );
+        let version = self.state.bin.get(&path).map(|b| b.version).unwrap_or(1);
         self.send_to(
             from,
             Msg::BinaryDelta {
                 path,
                 hash: binary::sha256_hex(&data),
-                mtime_ms: mtime_ms(&full),
+                version,
                 ops,
             },
         );
@@ -759,7 +843,7 @@ impl Engine {
         from: PeerId,
         path: String,
         hash: String,
-        mtime_ms: u64,
+        version: u64,
         ops: Vec<DeltaOp>,
     ) -> Result<()> {
         let base = std::fs::read(self.cfg.root.join(&path)).unwrap_or_default();
@@ -769,12 +853,13 @@ impl Engine {
             anyhow::bail!("{path}: delta from {} reconstructed to {} but peer said {hash}", format_id(from), got);
         }
         self.write_file(&path, &rebuilt)?;
+        let version = version.max(self.state.bin.get(&path).map(|b| b.version).unwrap_or(0));
         self.state.bin.insert(
             path.clone(),
             BinEntry {
                 hash,
                 len: rebuilt.len() as u64,
-                mtime_ms,
+                version,
             },
         );
         self.dirty = true;
@@ -805,35 +890,228 @@ impl Engine {
         }
     }
 
-    /// Bring a freshly connected peer up to date: every text document as a
-    /// snapshot, every binary file as metadata. This doubles as the
-    /// reconnect-after-offline path — a snapshot subsumes any ops the peer
-    /// missed while it was gone.
+    /// Bring a freshly connected peer up to date.
+    ///
+    /// Sends a *manifest* of hashes rather than a snapshot per file: the common
+    /// reconnect case is that most files already agree, and a full CRDT
+    /// snapshot per file is far heavier than a hash. The peer asks for only
+    /// what actually differs. This doubles as the reconnect-after-offline
+    /// path — a snapshot subsumes any ops missed while the link was down.
     fn send_catchup(&mut self, peer: PeerId) {
-        let mut msgs: Vec<Msg> = Vec::new();
-        for (path, entry) in &self.state.text {
-            msgs.push(Msg::Snapshot {
+        let manifest = self.manifest();
+        if let Msg::Manifest { text, bin } = &manifest {
+            if !text.is_empty() || !bin.is_empty() {
+                println!(
+                    "[peer] offering {} text + {} binary file(s) to {}",
+                    text.len(),
+                    bin.len(),
+                    format_id(peer)
+                );
+            }
+        }
+        self.send_to(peer, manifest);
+    }
+
+    fn manifest(&self) -> Msg {
+        Msg::Manifest {
+            text: self
+                .state
+                .text
+                .iter()
+                .map(|(path, e)| TextDigest {
+                    path: path.clone(),
+                    hash: binary::sha256_hex(e.doc.text().as_bytes()),
+                    base: e.base,
+                    tombstones: e.doc.tombstones() as u64,
+                })
+                .collect(),
+            bin: self
+                .state
+                .bin
+                .iter()
+                .map(|(path, b)| BinDigest {
+                    path: path.clone(),
+                    hash: b.hash.clone(),
+                    len: b.len,
+                    version: b.version,
+                })
+                .collect(),
+        }
+    }
+
+    /// Compare a peer's manifest against ours and ask only for what differs.
+    fn on_manifest(&mut self, from: PeerId, text: Vec<TextDigest>, bin: Vec<BinDigest>) -> Result<()> {
+        let mut want: Vec<String> = Vec::new();
+        let mut agreed = 0usize;
+        for d in &text {
+            match self.state.text.get(&d.path) {
+                // Already identical, same lineage: nothing to exchange. This is
+                // the case the manifest exists to make free.
+                Some(local) if local.base == d.base && binary::sha256_hex(local.doc.text().as_bytes()) == d.hash => {
+                    agreed += 1;
+                }
+                _ => want.push(d.path.clone()),
+            }
+        }
+        // Record what the peer holds, so compaction can require unanimity.
+        if let Some(p) = self.peers.get_mut(&from) {
+            p.digests = text.into_iter().map(|d| (d.path, (d.hash, d.base))).collect();
+        }
+
+        if self.cfg.verbose || !want.is_empty() {
+            println!(
+                "[peer] {}: {agreed} file(s) already in sync, requesting {}",
+                format_id(from),
+                want.len()
+            );
+        }
+        if !want.is_empty() {
+            self.send_to(from, Msg::SnapshotRequest { paths: want });
+        }
+        // Binary files are compared by hash already, so reuse that path.
+        for d in bin {
+            self.on_binary_meta(from, d.path, d.hash, d.len, d.version)?;
+        }
+        Ok(())
+    }
+
+    fn on_snapshot_request(&mut self, from: PeerId, paths: Vec<String>) -> Result<()> {
+        for path in paths {
+            let Some(entry) = self.state.text.get(&path) else { continue };
+            let msg = Msg::Snapshot {
                 path: path.clone(),
                 elems: entry.doc.snapshot(),
                 text_hash: binary::sha256_hex(entry.doc.text().as_bytes()),
                 base: entry.base,
-                mtime_ms: mtime_ms(&self.cfg.root.join(path)),
-            });
+                mtime_ms: mtime_ms(&self.cfg.root.join(&path)),
+            };
+            self.send_to(from, msg);
         }
-        for (path, b) in &self.state.bin {
-            msgs.push(Msg::BinaryMeta {
-                path: path.clone(),
-                hash: b.hash.clone(),
-                len: b.len,
-                mtime_ms: b.mtime_ms,
-            });
+        Ok(())
+    }
+
+    /// Drop tombstones once every connected peer agrees on the visible text.
+    ///
+    /// Safe tombstone collection needs causal stability — proof that every
+    /// replica has seen the deletions. Unanimous agreement on the text hash is
+    /// that proof for the peers we can see. The compacted document gets a fresh
+    /// content-derived lineage, so peers rebuild identical id spaces; a peer
+    /// that was offline for the checkpoint comes back on an older lineage and
+    /// reconciles through the normal snapshot path.
+    fn maybe_compact(&mut self) {
+        if self.last_compaction_check.elapsed() < compaction_interval() {
+            return;
         }
-        if !msgs.is_empty() {
-            println!("[peer] sending {} file(s) to {}", msgs.len(), format_id(peer));
+        self.last_compaction_check = Instant::now();
+        if self.peers.is_empty() {
+            return; // no proof anyone else has the deletions
         }
-        for m in msgs {
-            self.send_to(peer, m);
+
+        // Re-advertise what we hold. Digests captured at connect time go stale
+        // the moment anyone edits, so without this refresh the unanimity check
+        // below could never be satisfied and compaction would never run. It
+        // doubles as anti-entropy: a peer that somehow drifted will notice the
+        // hash mismatch and ask for a snapshot.
+        let manifest = self.manifest();
+        self.broadcast(manifest, None);
+
+        let threshold = compaction_threshold();
+        // Only the lowest-numbered peer issues checkpoints, so two peers don't
+        // race to compact the same document into different lineages.
+        if self.peers.keys().any(|p| *p < self.cfg.peer_id) {
+            return;
         }
+        // Every peer we have ever seen must be present. A checkpoint rewrites
+        // the id space, so an absent peer would come back on a dead lineage and
+        // have its offline edits resolved by last-writer-wins instead of merged.
+        if !self.state.known_peers.iter().all(|p| self.peers.contains_key(p)) {
+            if self.cfg.verbose {
+                println!(
+                    "[compact] deferring: {} of {} known peer(s) connected",
+                    self.peers.len(),
+                    self.state.known_peers.len()
+                );
+            }
+            return;
+        }
+
+        let candidates: Vec<(String, String)> = self
+            .state
+            .text
+            .iter()
+            .filter(|(_, e)| e.doc.tombstones() >= threshold && e.doc.tombstones() * 2 >= e.doc.len_raw())
+            .map(|(p, e)| (p.clone(), binary::sha256_hex(e.doc.text().as_bytes())))
+            .collect();
+
+        for (path, hash) in candidates {
+            let base = self.state.text[&path].base;
+            let unanimous = self
+                .peers
+                .values()
+                .all(|p| p.digests.get(&path) == Some(&(hash.clone(), base)));
+            if !unanimous {
+                continue;
+            }
+            let text = self.state.text[&path].doc.text();
+            let (mut doc, new_base) = Doc::from_shared_content(&path, &text);
+            doc.set_peer(self.cfg.peer_id);
+            if new_base == base {
+                continue; // already compact under this lineage
+            }
+            let before = self.state.text[&path].doc.len_raw();
+            let elems = doc.snapshot();
+            println!(
+                "[compact] {path}: {before} elements -> {} (dropped {} tombstones)",
+                elems.len(),
+                before - elems.len()
+            );
+            self.state.text.insert(path.clone(), TextEntry { doc, base: new_base });
+            self.dirty = true;
+            self.broadcast(
+                Msg::Checkpoint {
+                    path,
+                    elems,
+                    base: new_base,
+                    text_hash: hash,
+                },
+                None,
+            );
+        }
+    }
+
+    /// Adopt a compacted document, but only if our visible text already matches
+    /// it — otherwise we would silently discard local edits.
+    fn on_checkpoint(
+        &mut self,
+        from: PeerId,
+        path: String,
+        elems: Vec<crdt::Elem>,
+        base: PeerId,
+        text_hash: String,
+    ) -> Result<()> {
+        self.absorb_local_edits(&path)?;
+        let Some(entry) = self.state.text.get_mut(&path) else { return Ok(()) };
+        let local_hash = binary::sha256_hex(entry.doc.text().as_bytes());
+        if local_hash != text_hash {
+            if self.cfg.verbose {
+                println!("[recv] {path}: declining checkpoint from {} (text differs)", format_id(from));
+            }
+            return Ok(());
+        }
+        if entry.base == base {
+            return Ok(());
+        }
+        let before = entry.doc.len_raw();
+        entry.doc.adopt(elems);
+        entry.doc.set_peer(self.cfg.peer_id);
+        entry.base = base;
+        self.dirty = true;
+        println!(
+            "[recv] {path}: compacted {before} -> {} elements per checkpoint from {}",
+            self.state.text[&path].doc.len_raw(),
+            format_id(from)
+        );
+        Ok(())
     }
 
     // ---- disk --------------------------------------------------------
@@ -929,7 +1207,7 @@ impl Engine {
                         BinEntry {
                             hash,
                             len: bytes.len() as u64,
-                            mtime_ms: mtime_ms(&path),
+                            version: 1,
                         },
                     );
                     self.dirty = true;
@@ -946,14 +1224,11 @@ impl Engine {
                     }
                 }
                 None => {
-                    let (doc, _) = Doc::from_text(self.cfg.peer_id, &text);
-                    self.state.text.insert(
-                        rel,
-                        TextEntry {
-                            doc,
-                            base: self.cfg.peer_id,
-                        },
-                    );
+                    // Content-derived lineage: two machines that were handed
+                    // the same folder converge without a conflict copy.
+                    let (mut doc, base) = Doc::from_shared_content(&rel, &text);
+                    doc.set_peer(self.cfg.peer_id);
+                    self.state.text.insert(rel, TextEntry { doc, base });
                     self.dirty = true;
                 }
             }
@@ -981,6 +1256,7 @@ fn spawn_dialer(
     tls: Option<Tls>,
     ev_tx: mpsc::UnboundedSender<Event>,
     live: Arc<Mutex<std::collections::HashSet<String>>>,
+    secret: Option<Vec<u8>>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -988,7 +1264,18 @@ fn spawn_dialer(
             if !already {
                 if let Ok(s) = net::connect(&addr, tls.as_ref()).await {
                     live.lock().await.insert(addr.clone());
-                    let _ = pump(s, me.clone(), ev_tx.clone(), addr.clone()).await;
+                    if let Err(e) = pump(
+                        s,
+                        me.clone(),
+                        ev_tx.clone(),
+                        addr.clone(),
+                        Role::Initiator,
+                        secret.clone(),
+                    )
+                    .await
+                    {
+                        eprintln!("[net] {addr}: {e:#}");
+                    }
                     live.lock().await.remove(&addr);
                 }
             }
@@ -999,27 +1286,87 @@ fn spawn_dialer(
 
 /// Handshake, then shuttle messages between the socket and the engine until the
 /// connection drops.
+#[allow(clippy::too_many_arguments)]
 async fn pump(
     stream: Stream,
     me: (PeerId, String),
     ev_tx: mpsc::UnboundedSender<Event>,
     addr: String,
+    role: Role,
+    secret: Option<Vec<u8>>,
 ) -> Result<()> {
+    // Bind authentication to this TLS certificate before consuming the stream.
+    let binding = stream.channel_binding();
     let (mut rd, mut wr) = stream.split();
+
+    let our_nonce = auth::random_nonce();
     write_msg(
         &mut wr,
         &Msg::Hello {
             peer_id: me.0,
             name: me.1.clone(),
+            nonce: our_nonce.to_vec(),
+            authenticated: secret.is_some(),
         },
     )
     .await?;
-    let (peer_id, name) = match read_msg(&mut rd).await? {
-        Msg::Hello { peer_id, name } => (peer_id, name),
+    let (peer_id, name, their_nonce, they_authenticate) = match read_msg(&mut rd).await? {
+        Msg::Hello {
+            peer_id,
+            name,
+            nonce,
+            authenticated,
+        } => {
+            let n: auth::Nonce = nonce
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("peer sent a malformed nonce"))?;
+            (peer_id, name, n, authenticated)
+        }
         other => anyhow::bail!("expected Hello, got {other:?}"),
     };
     if peer_id == me.0 {
         return Ok(()); // that's us on the other end
+    }
+
+    // Refuse to sync in the clear with a peer that expects authentication, or
+    // vice versa — a silent downgrade is worse than a visible failure.
+    match (&secret, they_authenticate) {
+        (Some(secret), true) => {
+            let (init_nonce, resp_nonce) = match role {
+                Role::Initiator => (our_nonce, their_nonce),
+                Role::Responder => (their_nonce, our_nonce),
+            };
+            let proof = auth::mac(secret, role, &init_nonce, &resp_nonce, binding.as_ref());
+            write_msg(&mut wr, &Msg::Auth { mac: proof }).await?;
+            let presented = match read_msg(&mut rd).await? {
+                Msg::Auth { mac } => mac,
+                other => anyhow::bail!("expected Auth, got {other:?}"),
+            };
+            auth::verify(
+                secret,
+                role.peer(),
+                &init_nonce,
+                &resp_nonce,
+                binding.as_ref(),
+                &presented,
+            )?;
+            if binding.is_none() {
+                eprintln!(
+                    "[auth] {} authenticated over plaintext: authorized, but not protected \
+                     against an active man-in-the-middle. Add --tls.",
+                    format_id(peer_id)
+                );
+            }
+        }
+        (None, false) => {}
+        (Some(_), false) => anyhow::bail!(
+            "peer {} does not authenticate but we require a shared secret",
+            format_id(peer_id)
+        ),
+        (None, true) => anyhow::bail!(
+            "peer {} requires a shared secret; start this peer with --secret",
+            format_id(peer_id)
+        ),
     }
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();

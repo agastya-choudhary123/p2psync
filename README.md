@@ -36,10 +36,21 @@ cargo build --release
 # now edit a file in ~/sync-a and watch it appear in ~/sync-b
 ```
 
-On a LAN, let the peers find each other and encrypt the link:
+On a LAN, let the peers find each other, encrypt the link, and require a
+shared secret so only your machines can join:
 
 ```bash
-./target/release/p2psync ~/sync -l 0.0.0.0:7901 --discover --tls
+./target/release/p2psync ~/sync -l 0.0.0.0:7901 --discover --tls --secret "$MY_KEY"
+```
+
+Exclude paths with a `.p2psyncignore` in the sync root (gitignore-style globs,
+`*`/`?`/`**`, trailing `/` for directories):
+
+```
+*.log
+build/
+node_modules
+**/*.tmp
 ```
 
 `--discover` advertises over mDNS (`_p2psync._tcp.local.`). Bind to a routable
@@ -64,6 +75,14 @@ skips elements with a *higher* id, so concurrent inserts at the same position
 land in an order every replica computes identically — the tiebreak is the peer
 id. Operations are commutative and idempotent, so arrival order and
 retransmission don't matter.
+
+Elements live in an append-only arena threaded into a doubly linked list, with a
+hash map from id to slot. The obvious first implementation — a flat `Vec` with
+linear search — is quadratic in document length: loading a 220 KB file took
+**17.9 seconds**, because each of 220,000 inserts scanned and memmoved the whole
+vector. The arena makes origin lookup and splicing O(1), bringing that to
+**27.8 ms**. The only forward scan left is across the handful of *concurrent*
+siblings competing for one position.
 
 Two details that matter in practice:
 
@@ -122,17 +141,82 @@ rsync exchange: the receiver sends 4 KB block signatures (rsync's rolling
 checksum plus a truncated SHA-256), the sender computes copy/literal
 instructions against them, and the receiver reconstructs and verifies the hash
 before writing. The rolling checksum slides one byte at a time, so an insertion
-near the front of a file resyncs instead of resending everything. Conflicts are
-last-writer-wins on mtime, tiebroken by peer id.
+near the front of a file resyncs instead of resending everything.
+
+Conflicts are last-writer-wins, but on a **logical (Lamport) version** rather
+than a wall clock: two machines whose clocks disagree would otherwise hand the
+win to whichever one is set further ahead. Each local write bumps the version
+past anything seen for that path, and the peer id breaks ties.
+
+### Authentication (`src/auth.rs`)
+
+Self-signed certificates encrypt but authenticate nothing, which leaves two
+holes: anyone who can reach the port becomes a peer, and an active MITM can
+impersonate one. `--secret` closes both. After `Hello` (which carries a 32-byte
+nonce from each side) both peers send
+
+```text
+HMAC-SHA256(secret, role || nonce_initiator || nonce_responder || cert_fingerprint)
+```
+
+`role` stops an attacker reflecting our own proof back at us. The certificate
+fingerprint is the part that defeats interception: to sit in the middle, a relay
+must present its own certificate to the dialer while speaking to the real
+listener as a client, so the two ends hash different certificates and the MACs
+disagree. `intercepted_tls_connection_fails_authentication` builds exactly that
+relay and asserts no data crosses it — with a control peer dialing directly, so
+the test can't pass vacuously. Mismatched configurations fail loudly rather than
+silently downgrading to an open link.
+
+### Catch-up by manifest
+
+On connect a peer sends a *manifest* of `(path, text_hash, base)` rather than a
+snapshot per file, and the other side asks only for what it's missing or what
+differs. The common reconnect case — where most files already agree — costs a
+hash per file instead of a full CRDT document. The manifest is also re-broadcast
+periodically, which keeps peers' views of each other fresh and doubles as
+anti-entropy: a replica that somehow drifted sees the hash mismatch and pulls a
+snapshot.
+
+### Tombstone compaction
+
+Deleted characters are tombstones, so a churned document grows without bound.
+Collecting them safely needs causal stability — proof that every replica has seen
+the deletions — and unanimous agreement on the text hash is that proof. When a
+document is sufficiently bloated and every known peer reports the same hash and
+lineage, the lowest-numbered peer issues a `Checkpoint`: the same visible text
+with tombstones dropped and a fresh content-derived lineage. Peers adopt it only
+if their own text already matches, so it can never silently discard an edit.
+
+Two guards matter. Only the lowest peer id issues checkpoints, so two peers can't
+compact into divergent lineages. And *every peer ever seen* must be connected —
+rewriting the id space while someone is away would demote their offline edits
+from a clean merge to last-writer-wins, so a missing peer defers compaction
+indefinitely rather than risking that.
 
 ### Reconnection
 
-Each configured peer has a dialer that retries every second. On connect, a peer
-sends a snapshot of every text document and metadata for every binary file —
-which subsumes whatever operations were missed while the link was down, so
-there's no separate replay log. Document state is persisted to
-`.p2psync/state.msgpack`, so a restarted peer keeps its character ids instead of
-re-deriving a fresh, incompatible id space.
+Each configured peer has a dialer that retries every second. Catch-up runs
+through the manifest above, so a returning peer receives snapshots only for what
+actually changed — which subsumes whatever operations it missed, with no separate
+replay log. Document state is persisted to `.p2psync/state.msgpack`, so a
+restarted peer keeps its character ids instead of re-deriving a fresh,
+incompatible id space.
+
+### Shared-content lineage
+
+Two independently created documents for one path have disjoint id spaces, so
+merging them as CRDTs would duplicate the text. The fix is to derive character
+ids from the content itself: a new file's lineage is a hash of its path and
+bytes, so two machines handed *the same* folder build byte-identical documents
+and merge as a true CRDT — no conflict copy, no lost edit. The peer component of
+the id includes the content hash, so genuinely different content still gets
+distinct ids and two different characters can never collide on one id.
+
+That covers the overwhelmingly common real case (copy a folder to two laptops,
+then edit both). Unrelated content at the same path has no correct merge, so it
+still falls back to last-writer-wins with the loser preserved as
+`<path>.conflict-<peer>`.
 
 ## Measured performance
 
@@ -143,7 +227,7 @@ Reproduce with `cargo run --release --bin bench`.
 
 | debounce | p50 | p90 | p99 | max |
 |---|---|---|---|---|
-| 40ms (default) | 58.6ms | 62.9ms | 64.3ms | 64.4ms |
+| 40ms (default) | 56.0ms | 57.7ms | 58.3ms | 58.5ms |
 | 1ms (`P2PSYNC_DEBOUNCE_MS=1`) | 14.4ms | 15.5ms | 16.2ms | 16.3ms |
 
 The debounce is a hard floor, so the second row is the honest measure of the
@@ -163,18 +247,33 @@ Bulk typing approaches 1:1 thanks to run compression. An *isolated* single
 character costs ~40 bytes, and that floor is inherent to character-granular
 CRDTs: the op carries two 64-bit ids plus the file path.
 
+**CRDT cost vs. document size** (`cargo run --release --example scale_probe`),
+before and after the arena rewrite:
+
+| document | load (Vec) | load (arena) | 1-char edit | 2000-char paste |
+|---|---|---|---|---|
+| 3 K chars | 0.6ms | 0.2ms | 0.015ms | 0.3ms |
+| 12 K chars | 49.5ms | 1.7ms | 0.109ms | 0.4ms |
+| 56 K chars | 1,072ms | 7.9ms | 0.514ms | 0.8ms |
+| 221 K chars | 17,884ms | **27.8ms** | 2.5ms | 1.9ms |
+
+Loading is now linear rather than quadratic. Single-character edits got slightly
+slower (1.6ms → 2.5ms at 221 K chars) because walking a linked list has worse
+cache locality than scanning a `Vec` — a fine trade for removing an 18-second
+stall.
+
 **Scalability** — latency to the slowest peer in a full mesh:
 
 | peers | p50 (40ms debounce) | p50 (1ms) |
 |---|---|---|
-| 3 | 58.2ms | 14.6ms |
-| 5 | 59.4ms | 14.9ms |
-| 10 | 63.4ms | 16.6ms |
+| 3 | 56.9ms | 14.6ms |
+| 5 | 57.0ms | 14.9ms |
+| 10 | 58.1ms | 16.6ms |
 
-Fan-out is per-peer serialization, so 10 peers costs ~2ms more than 3.
+Fan-out is per-peer serialization, so 10 peers costs ~1ms more than 3.
 
 **Recovery** — a cold peer joining after missing 200 edits (6,096 bytes) caught
-up in **2.4ms** and streamed normally afterwards.
+up in **4.5ms** and streamed normally afterwards.
 
 **Convergence** — verified by fuzzing rather than asserted: 2–5 replicas, random
 concurrent inserts and deletes, shuffled delivery, duplicated messages, and
@@ -185,7 +284,7 @@ disk.
 ## Tests
 
 ```bash
-cargo test              # 29 tests
+cargo test              # 46 tests
 ```
 
 - `tests/crdt.rs` — convergence and commutativity fuzzing, causal buffering,
@@ -196,50 +295,75 @@ cargo test              # 29 tests
   directions, incremental edits, echo suppression, simultaneous edits
   converging on disk, binary delta, deletes, nested directories, TLS, and
   reconnect-after-offline.
+- `tests/hardening.rs` — authentication (right secret, wrong secret, missing
+  secret, and a real TLS-terminating MITM relay), independently-created files
+  merging without a conflict copy, ignore rules, manifest catch-up, and
+  tombstone compaction.
+- `src/auth.rs` unit tests — reflected proofs, wrong keys, mismatched channel
+  bindings, nonce reuse.
 
 ## Limitations
 
-These are real, and none of them are hidden by the tests:
+### Fixed since the first cut
 
-- **TLS is encryption without authentication.** Certificates are self-signed and
-  the verifier accepts any of them, so a passive observer is defeated but an
-  active MITM is not. Real use needs pinned fingerprints or a shared CA. There
-  is no pairing or authorization step: anything that can reach the port and
-  speak the protocol becomes a peer.
-- **RGA is stored as a flat `Vec` with linear scans**, so integrating one op is
-  O(document length). Fine for source files and notes; a megabyte-scale text
-  file will crawl. A block-wise RGA with an index is the fix.
-- **Tombstones are never collected.** A long-lived document grows monotonically
-  with deleted characters.
-- **Catch-up sends whole snapshots**, not a delta of CRDT state, so reconnecting
-  with many large files is heavier than it needs to be.
-- **First contact between two independently-created copies of the same path is
-  not a CRDT merge.** Their id spaces are disjoint, so merging would duplicate
-  the text. Instead the lower peer id wins the lineage, the other rebases onto
-  it, and the surviving *content* is last-writer-wins on mtime with the loser
-  kept as `<path>.conflict-<peer>`. Every edit after that point is a true merge.
-  Reconciling unrelated histories is a policy choice, not something a CRDT
-  decides for you.
-- **Binary conflicts trust mtime**, so clock skew between machines can pick the
-  wrong winner.
-- **Ignore rules are hardcoded** (`.p2psync`, `.git`, `.DS_Store`, editor swap
-  files). No `.syncignore`.
-- **RGA can interleave** two peers typing different words at the identical
-  position. The result is deterministic and identical everywhere, which is what
-  convergence guarantees, but it may not be what either author wanted.
+Each of these was a real limitation; each has a test that fails without the fix.
+
+- **Quadratic CRDT loading** → arena + linked list. 17.9s → 27.8ms for 220 KB.
+- **TLS without authentication** → `--secret` with HMAC proofs bound to the TLS
+  certificate. Verified against an actual interception proxy.
+- **Anyone could join** → same mechanism; mismatched configs fail loudly instead
+  of downgrading.
+- **Unbounded tombstone growth** → checkpoint compaction on unanimous agreement.
+- **Whole-snapshot catch-up** → manifest of hashes; identical files cost nothing.
+- **Binary conflicts trusted the wall clock** → logical Lamport versions.
+- **Hardcoded ignore rules** → `.p2psyncignore` with glob support.
+- **Two copies of one file couldn't merge** → content-derived lineage, so the
+  copy-a-folder-to-two-machines case is now a true CRDT merge.
+
+### Still real
+
+- **RGA can interleave** two peers typing *different words at the identical
+  position*. The result is deterministic and identical everywhere, which is what
+  convergence guarantees, but it may not be what either author wanted. This is
+  inherent to RGA; avoiding it means a different algorithm (Fugue, Peritext), not
+  a patch. In practice file sync diffs whole files, so edits arrive as contiguous
+  runs anchored to surviving characters, and interleaving is rare.
+- **Genuinely different content at the same path is still last-writer-wins**,
+  now on mtime, with the loser kept as `<path>.conflict-<peer>`. There is no
+  shared history to merge and no logical clock spanning unrelated documents, so
+  something has to lose; the choice is which, and whether the loser survives.
+- **Compaction defers to absent peers.** It requires every peer ever seen to be
+  connected, so one permanently-dead peer means tombstones accumulate forever.
+  Correct-but-conservative: the alternative risks demoting an offline peer's
+  edits to last-writer-wins.
+- **A differing file still ships its whole document.** The manifest skips files
+  that agree, but a one-character difference sends the full CRDT state. Version
+  vectors and an op log would fix it.
+- **Per-edit work is O(file size)** regardless of the CRDT: every save re-reads
+  the file, diffs it, and rewrites it on the far side. Fine to a few hundred KB.
+- **`--secret` over plaintext is authorization only.** With no certificate there
+  is nothing to bind to, so an active MITM is still possible; the process says so
+  on startup. Use `--tls`.
+- **No NAT traversal.** mDNS covers a LAN; anything else needs manual
+  `--peer host:port` and reachable ports.
+- **Untested territory:** two physically separate machines, Linux/inotify (the
+  code is portable via `notify` but only FSEvents has been exercised),
+  multi-hour uptime, thousands of files, symlinks, permissions, and non-UTF-8
+  filenames.
 
 ## Layout
 
 ```
-src/crdt.rs      RGA: CharId, Op, Doc, causal buffering, snapshot merge
+src/crdt.rs      RGA: CharId, Op, Doc, arena + linked list, causal buffering
 src/diff.rs      Myers diff + change detector (file content → CRDT ops)
 src/wire.rs      framing, MessagePack messages, run compression
-src/net.rs       TCP and TLS transport
-src/watcher.rs   FSEvents watching, debouncing, ignore rules
+src/net.rs       TCP and TLS transport, certificate fingerprints
+src/auth.rs      pre-shared-key proofs with TLS channel binding
+src/ignore.rs    .p2psyncignore parsing and glob matching
+src/watcher.rs   FSEvents watching, debouncing
 src/binary.rs    SHA-256, rolling checksum, rsync-style delta
 src/engine.rs    the state machine tying it together
 src/discovery.rs mDNS advertise + browse
 src/bin/bench.rs benchmark harness
+examples/        scale_probe: CRDT cost vs. document size
 ```
-
-Roughly 2,300 lines of implementation and 730 of tests.

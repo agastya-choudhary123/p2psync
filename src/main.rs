@@ -32,6 +32,11 @@ struct Args {
     #[arg(long)]
     discover: bool,
 
+    /// Shared secret every peer must prove. Also read from P2PSYNC_SECRET.
+    /// Combine with --tls to also rule out an active man-in-the-middle.
+    #[arg(long)]
+    secret: Option<String>,
+
     /// Log merges and snapshots, not just edits.
     #[arg(short, long)]
     verbose: bool,
@@ -69,6 +74,14 @@ async fn main() -> Result<()> {
     });
     let peer_id = peer_id_for(&args.dir, &name)?;
 
+    let secret = p2psync::auth::resolve_secret(args.secret);
+    if secret.is_none() {
+        eprintln!(
+            "[auth] no shared secret: any host that can reach this port can sync. \
+             Pass --secret to require authentication."
+        );
+    }
+
     let cfg = engine::Config {
         root: args.dir,
         peer_id,
@@ -78,6 +91,7 @@ async fn main() -> Result<()> {
         tls: args.tls,
         discovery: args.discover,
         verbose: args.verbose,
+        secret,
     };
     engine::Engine::run(cfg).await
 }
