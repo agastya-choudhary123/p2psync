@@ -19,6 +19,16 @@
 //! before this change, because every one of 220,000 inserts scanned and
 //! memmoved the whole vector. Walking the list to produce the text is still
 //! O(n), but that is inherent to writing the file out.
+//!
+//! # Memory Optimization
+//!
+//! The in-memory `Node` structure packs element data efficiently:
+//! - `origin` is stored as a u32 slot index with u32::MAX as "start of document",
+//!   instead of an `Option<CharId>` (saves 20 bytes per node).
+//! - `next` and `prev` use u32::MAX sentinel instead of `Option<u32>`
+//!   (saves 8 bytes per node).
+//! The serialized `Elem` format remains unchanged for wire and disk compatibility.
+//! Reconstruction happens on demand via `Node::to_elem()` during serialization.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -42,6 +52,8 @@ impl CharId {
         Self { clock, peer }
     }
 }
+
+const NONE_SLOT: u32 = u32::MAX;
 
 impl std::fmt::Debug for CharId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -78,11 +90,49 @@ pub struct Elem {
     pub deleted: bool,
 }
 
+/// In-memory node: compact version of Elem that stores origin as a slot index.
+/// Actual CharId values are reconstructed on demand during serialization.
 #[derive(Clone, Debug)]
 struct Node {
-    elem: Elem,
-    next: Option<u32>,
-    prev: Option<u32>,
+    id: CharId,
+    ch: char,
+    deleted: bool,
+    // u32::MAX means "start of document" (None)
+    origin_slot: u32,
+    // u32::MAX means None
+    next: u32,
+    // u32::MAX means None
+    prev: u32,
+}
+
+impl Node {
+    /// Convert to the serializable Elem form by reconstructing origin from slot.
+    fn to_elem(&self, arena: &[Node]) -> Elem {
+        let origin = if self.origin_slot == NONE_SLOT {
+            None
+        } else {
+            Some(arena[self.origin_slot as usize].id)
+        };
+        Elem {
+            id: self.id,
+            origin,
+            ch: self.ch,
+            deleted: self.deleted,
+        }
+    }
+
+    /// Create a node from an Elem, looking up the origin slot by id.
+    /// Used when adopting or integrating.
+    fn from_elem(elem: Elem, origin_slot: u32, next: u32, prev: u32) -> Self {
+        Node {
+            id: elem.id,
+            ch: elem.ch,
+            deleted: elem.deleted,
+            origin_slot,
+            next,
+            prev,
+        }
+    }
 }
 
 /// Serialized form: just the elements in document order. Links and indexes are
@@ -168,13 +218,15 @@ impl Doc {
     }
 
     /// Walk the list in document order.
-    fn iter(&self) -> impl Iterator<Item = &Elem> {
+    /// Returns cloned Elem to avoid lifetime issues with the reconstruction.
+    fn iter(&self) -> impl Iterator<Item = Elem> + '_ {
         let mut cur = self.head;
+        let arena = &self.arena;
         std::iter::from_fn(move || {
             let i = cur?;
-            let node = &self.arena[i as usize];
-            cur = node.next;
-            Some(&node.elem)
+            let node = &arena[i as usize];
+            cur = if node.next == NONE_SLOT { None } else { Some(node.next) };
+            Some(node.to_elem(arena))
         })
     }
 
@@ -195,7 +247,7 @@ impl Doc {
 
     /// Elements in document order, tombstones included.
     pub fn snapshot(&self) -> Vec<Elem> {
-        self.iter().cloned().collect()
+        self.iter().collect()
     }
 
     /// Number of stored elements, tombstones included.
@@ -205,7 +257,7 @@ impl Doc {
 
     /// How many stored elements are tombstones. Drives compaction decisions.
     pub fn tombstones(&self) -> usize {
-        self.arena.iter().filter(|n| n.elem.deleted).count()
+        self.arena.iter().filter(|n| n.deleted).count()
     }
 
     // ---- local edits -------------------------------------------------
@@ -256,8 +308,8 @@ impl Doc {
             }
             Op::Delete { id } => match self.slot.get(&id) {
                 Some(&i) => {
-                    let was = self.arena[i as usize].elem.deleted;
-                    self.arena[i as usize].elem.deleted = true;
+                    let was = self.arena[i as usize].deleted;
+                    self.arena[i as usize].deleted = true;
                     !was
                 }
                 // Delete arrived before the insert it refers to.
@@ -308,56 +360,71 @@ impl Doc {
             let i = i as u32;
             self.clock = self.clock.max(elem.id.clock);
             self.slot.insert(elem.id, i);
-            self.arena.push(Node {
-                elem,
-                prev: if i == 0 { None } else { Some(i - 1) },
-                next: if i as usize + 1 == n { None } else { Some(i + 1) },
-            });
+
+            // Look up origin slot
+            let origin_slot = elem.origin.map(|o| self.slot[&o]).unwrap_or(NONE_SLOT);
+
+            let prev = if i == 0 { NONE_SLOT } else { i - 1 };
+            let next = if i as usize + 1 == n { NONE_SLOT } else { i + 1 };
+
+            self.arena.push(Node::from_elem(elem, origin_slot, next, prev));
         }
         self.head = if n == 0 { None } else { Some(0) };
         self.tail = if n == 0 { None } else { Some(n as u32 - 1) };
         self.pending.clear();
         self.pending_deletes.clear();
+
+        // Reduce memory footprint after loading
+        self.arena.shrink_to_fit();
+        self.slot.shrink_to_fit();
     }
 
     /// RGA integration: walk forward from `origin`, skipping elements that
     /// concurrent-and-later replicas would have placed ahead of us. The first
     /// element with a *smaller* id than ours is our insertion point.
     fn integrate_insert(&mut self, id: CharId, origin: Option<CharId>, ch: char) {
+        let origin_slot = origin.map(|o| self.slot[&o]).unwrap_or(NONE_SLOT);
         let mut prev = origin.map(|o| self.slot[&o]);
         let mut next = match prev {
-            Some(p) => self.arena[p as usize].next,
+            Some(p) => {
+                let p_next = self.arena[p as usize].next;
+                if p_next == NONE_SLOT { None } else { Some(p_next) }
+            }
             None => self.head,
         };
         // Only concurrent siblings are ever scanned here, so this stays short.
         while let Some(n) = next {
-            if self.arena[n as usize].elem.id < id {
+            if self.arena[n as usize].id < id {
                 break;
             }
             prev = Some(n);
-            next = self.arena[n as usize].next;
+            next = {
+                let n_next = self.arena[n as usize].next;
+                if n_next == NONE_SLOT { None } else { Some(n_next) }
+            };
         }
 
         // A tombstone may have been waiting for this element.
         let deleted = self.pending_deletes.remove(&id);
         let me = self.arena.len() as u32;
+        let prev_u32 = prev.unwrap_or(NONE_SLOT);
+        let next_u32 = next.unwrap_or(NONE_SLOT);
+
         self.arena.push(Node {
-            elem: Elem {
-                id,
-                origin,
-                ch,
-                deleted,
-            },
-            prev,
-            next,
+            id,
+            ch,
+            deleted,
+            origin_slot,
+            prev: prev_u32,
+            next: next_u32,
         });
         self.slot.insert(id, me);
         match prev {
-            Some(p) => self.arena[p as usize].next = Some(me),
+            Some(p) => self.arena[p as usize].next = me,
             None => self.head = Some(me),
         }
         match next {
-            Some(n) => self.arena[n as usize].prev = Some(me),
+            Some(n) => self.arena[n as usize].prev = me,
             None => self.tail = Some(me),
         }
     }
@@ -386,14 +453,17 @@ impl Doc {
 
     /// Build a document from scratch out of plain text, as local inserts.
     pub fn from_text(peer: PeerId, text: &str) -> (Self, Vec<Op>) {
+        let char_count = text.chars().count();
         let mut doc = Doc::new(peer);
-        let mut ops = Vec::with_capacity(text.len());
+        let mut ops = Vec::with_capacity(char_count);
         let mut prev = None;
         for ch in text.chars() {
             let op = doc.local_insert(prev, ch);
             prev = Some(op.id());
             ops.push(op);
         }
+        doc.arena.shrink_to_fit();
+        doc.slot.shrink_to_fit();
         (doc, ops)
     }
 
@@ -412,6 +482,8 @@ impl Doc {
             let op = doc.local_insert(prev, ch);
             prev = Some(op.id());
         }
+        doc.arena.shrink_to_fit();
+        doc.slot.shrink_to_fit();
         (doc, lineage)
     }
 }
