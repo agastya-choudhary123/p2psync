@@ -43,7 +43,7 @@ fn duplicate_ops_are_idempotent() {
 fn delete_before_insert_arrives() {
     let (mut a, mut ops) = Doc::from_text(1, "abc");
     let ids = a.visible_ids();
-    ops.push(a.local_delete(ids[1]));
+    ops.push(a.local_delete(ids.get(1).unwrap()));
     assert_eq!(a.text(), "ac");
 
     // Deliver the delete first; it must be held until 'b' shows up.
@@ -63,7 +63,7 @@ fn concurrent_inserts_at_same_position_converge() {
     assert_eq!(a.text(), base.text());
 
     // Peer A inserts "hello" after position 5, peer B inserts "world" there.
-    let anchor = a.visible_ids()[4];
+    let anchor = a.visible_ids().get(4).unwrap();
     let a_ops = insert_run(&mut a, Some(anchor), "hello");
     let b_ops = insert_run(&mut b, Some(anchor), "world");
 
@@ -145,14 +145,14 @@ fn fuzz_convergence_across_peers() {
                 for _ in 0..edits {
                     let visible = docs[i].visible_ids();
                     if !visible.is_empty() && rng.gen_bool(0.35) {
-                        let victim = visible[rng.gen_range(0..visible.len())];
+                        let victim = visible.get(rng.gen_range(0..visible.len())).unwrap();
                         let op = docs[i].local_delete(victim);
                         in_flight.push((i, op));
                     } else {
                         let anchor = if visible.is_empty() || rng.gen_bool(0.1) {
                             None
                         } else {
-                            Some(visible[rng.gen_range(0..visible.len())])
+                            visible.get(rng.gen_range(0..visible.len()))
                         };
                         let ch = (b'a' + rng.gen_range(0..26)) as char;
                         let op = docs[i].local_insert(anchor, ch);
@@ -210,7 +210,7 @@ fn fuzz_convergence_with_delayed_delivery() {
 
         // A builds a causal chain; B receives it in scrambled order.
         let mut chain = Vec::new();
-        let mut anchor = Some(a.visible_ids()[0]);
+        let mut anchor = a.visible_ids().get(0);
         for _ in 0..30 {
             let ch = (b'a' + rng.gen_range(0..26)) as char;
             let op = a.local_insert(anchor, ch);
@@ -233,8 +233,8 @@ fn snapshot_merge_matches_op_replay() {
     b.apply_all(base.iter().cloned());
 
     let ids = a.visible_ids();
-    a.local_delete(ids[0]);
-    a.local_insert(Some(ids[4]), '!');
+    a.local_delete(ids.get(0).unwrap());
+    a.local_insert(ids.get(4), '!');
 
     b.merge_snapshot(&a.snapshot());
     assert_eq!(b.text(), a.text());

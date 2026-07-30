@@ -76,19 +76,38 @@ land in an order every replica computes identically — the tiebreak is the peer
 id. Operations are commutative and idempotent, so arrival order and
 retransmission don't matter.
 
-Elements live in an append-only arena threaded into a doubly linked list, with a
-hash map from id to slot. The obvious first implementation — a flat `Vec` with
-linear search — is quadratic in document length: loading a 220 KB file took
-**17.9 seconds**, because each of 220,000 inserts scanned and memmoved the whole
-vector. The arena makes origin lookup and splicing O(1), bringing that to
-**20.0 ms**. The only forward scan left is across the handful of *concurrent*
-siblings competing for one position.
+**Storage is one record per run, not per character.** That distinction is the
+whole memory story. A character needs its own id, its origin, a tombstone flag
+and list links; even packed hard that is 40 bytes to hold one letter, so a
+660 KB file cost 26 MB of arena plus 41 MB of `CharId -> slot` hash map. Over
+100x the text, to store the text.
 
-The id-to-slot lookup is not a hash map. It stores *runs*: sequential typing
-produces consecutive clocks landing in consecutive slots, so one run covers a
-whole file, and a lookup is a binary search plus arithmetic. As a
-`HashMap<CharId, u32>` this index measured 41 MB for a 660 KB document —
-larger than the arena it indexed. See `src/slotindex.rs`.
+Nearly all of it is derivable, because of how ids are handed out: when someone
+types, each character's origin is the character before it, its clock is the
+previous clock plus one, and the peer never changes. A typed file is one
+arithmetic progression. So a `Block` holds a first id, a first origin, and a
+slice of text; character *i* has clock `clock + i` and origin "character
+*i - 1*", both computed. Characters live in one flat `Vec<char>` that blocks
+point into, so splitting a block moves no text — it hands out two ranges over
+the same buffer.
+
+A file typed start to finish is **one block**. An edit splits the block where it
+lands, so the count tracks edited *regions* rather than document length, and a
+checkpoint rebuilds it back to one. `examples/fragmentation_probe.rs` drives
+5,000 edits through the real change detector: 240 K characters end up in 16,480
+blocks (~15 characters each), per-edit cost stays flat at ~0.9 ms rather than
+degrading, and a checkpoint returns it to a single block.
+
+The linked list gives document order; `BlockIndex` maps an id to its block by
+binary search over the clock ranges each peer contributed. Both are sized by the
+number of blocks, not the number of characters.
+
+The obvious first implementation — a flat `Vec` with linear search — is
+quadratic in document length: loading a 220 KB file took **17.9 seconds**,
+because each of 220,000 inserts scanned and memmoved the whole vector. It is now
+**17.3 ms**. The only forward scan left is across the handful of *concurrent*
+siblings competing for one position, and because ids rise with offset inside a
+block, a whole block is skipped in one comparison rather than one per character.
 
 Two details that matter in practice:
 
@@ -271,8 +290,8 @@ before and after the arena rewrite:
 |---|---|---|---|---|
 | 3 K chars | 0.6ms | 0.2ms | 0.015ms | 0.3ms |
 | 12 K chars | 49.5ms | 1.7ms | 0.109ms | 0.4ms |
-| 56 K chars | 1,072ms | 7.9ms | 0.514ms | 0.8ms |
-| 221 K chars | 17,884ms | **20.0ms** | 2.4ms | 2.1ms |
+| 56 K chars | 1,072ms | 5.0ms | 0.349ms | 0.5ms |
+| 221 K chars | 17,884ms | **17.3ms** | 1.2ms | 1.2ms |
 
 Loading is now linear rather than quadratic. Single-character edits got slightly
 slower (1.6ms → 2.5ms at 221 K chars) because walking a linked list has worse
@@ -297,16 +316,19 @@ own and its origin's.
 |---|---|---|
 | bytes on the wire to sync a 108 KB file | 3.44 MB (31.6x) | **218 KB (2.0x)** |
 | `.p2psync/state.msgpack` | 50.6 MB (77x) | **1.3 MB (2.0x)** |
-| resident memory | 178 MB | **37.5 MB** |
+| resident memory | 178 MB | **12.2 MB** |
 | propagation latency while syncing it | p50 57ms, spikes to 117ms | **p50 57ms, max 60ms** |
 
-Three changes, in order of what they bought. `src/elemcodec.rs` encodes an
-element sequence as runs — sequential text costs a flags byte and the UTF-8 of
-the character, two bytes rather than 45 — and is used for both the wire and the
-state file. `src/slotindex.rs` replaces the `HashMap<CharId, u32>` with the same
-run idea, which mattered more than it sounds: `heap` showed that index at 41 MB,
-*larger than the 26 MB arena it indexed*. And state serialization streams
-instead of building the whole encoding in memory.
+One idea, applied three times: store a *run*, not a character.
+
+`src/elemcodec.rs` encodes an element sequence that way for the wire and the
+state file — sequential text costs a flags byte and the UTF-8 of the character,
+two bytes rather than 45. `Doc` itself stores blocks rather than per-character
+nodes, which is what took memory from 95 MB to 12 MB; the per-character design
+spent 26 MB on the arena and 41 MB on the `CharId -> slot` hash map, and `heap`
+showing that index *larger than the arena it indexed* is what pointed at the
+representation rather than at any one allocation. State serialization also
+streams instead of building the whole encoding in memory first.
 
 The latency spikes were the state file: 50 MB written synchronously every two
 seconds, landing on top of whatever edit was in flight. At 1.3 MB they are gone.
@@ -326,9 +348,13 @@ disk.
 ## Tests
 
 ```bash
-cargo test              # 47 tests
+cargo test              # 67 tests
 ```
 
+- `src/crdt.rs` unit tests — block invariants checked against the document's own
+  linked list after every operation (each character resolves back to its block,
+  links are consistent, counts agree), split/merge behaviour, and scrambled
+  delivery.
 - `tests/crdt.rs` — convergence and commutativity fuzzing, causal buffering,
   change-detector round-trips, wire compression round-trips.
 - `tests/binary.rs` — rolling checksum against recomputation, block reuse,
@@ -411,13 +437,19 @@ suite was green throughout, and stayed green while every one of them was live.
   vectors and an op log would fix it.
 - **Per-edit work is O(file size)** regardless of the CRDT: every save re-reads
   the file, diffs it, and rewrites it on the far side. Fine to a few hundred KB.
-- **Memory is still ~57x the text it is syncing.** A 660 KB file costs 37.5 MB
-  resident, down from 178 MB, but an empty directory costs 5.5 MB and the
-  remainder is the arena: one 40-byte node per character, and 40 is what
-  `CharId` (two `u64`s) forces once alignment is counted. Getting below this
-  needs block-wise elements — one node per *run* of characters rather than one
-  per character, the way Yjs and Automerge store text — which is a redesign of
-  `Doc`, not a tweak.
+- **Memory is ~18x the text**, down from ~270x. A 660 KB file costs 12.2 MB
+  resident against a 5.5 MB empty-directory baseline, so the document itself is
+  about 6.7 MB. Most of that is now the character buffer, which is a `Vec<char>`
+  at a flat 4 bytes per character — a `String` would be 1 byte for ASCII, at the
+  cost of mapping character offsets onto byte offsets inside every block.
+  Tombstoned text also stays in the buffer until a checkpoint rebuilds the
+  document.
+- **Sustained editing fragments a document** until a checkpoint recoalesces it:
+  every edit splits a block, and `examples/fragmentation_probe.rs` measures
+  5,000 edits taking 240 K characters from 1 block to 16,480. Per-edit cost is
+  flat across that range (~0.9 ms) so it is not a performance cliff, but the
+  memory win narrows as a document is edited, and it depends on compaction —
+  which itself defers while any known peer is offline, per the entry above.
 - **The state file is rewritten whole every 2 seconds** while you are typing.
   It is 2.0x the document now rather than 77x, so that is 1.3 MB rather than
   50 MB per write, but it is still the entire document each time. An op log with
@@ -446,7 +478,6 @@ suite was green throughout, and stayed green while every one of them was live.
 src/crdt.rs      RGA: CharId, Op, Doc, arena + linked list, causal buffering
 src/diff.rs      Myers diff + change detector (file content → CRDT ops)
 src/elemcodec.rs run-encoded element blocks, shared by the wire and state file
-src/slotindex.rs CharId -> arena slot as runs rather than one entry per char
 src/wire.rs      framing, MessagePack messages, run compression
 src/net.rs       TCP and TLS transport, certificate fingerprints
 src/auth.rs      pre-shared-key proofs with TLS channel binding

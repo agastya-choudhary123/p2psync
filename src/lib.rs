@@ -13,6 +13,5 @@ pub mod discovery;
 pub mod engine;
 pub mod ignore;
 pub mod net;
-pub mod slotindex;
 pub mod watcher;
 pub mod wire;

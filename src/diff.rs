@@ -147,17 +147,19 @@ pub fn detect(doc: &mut Doc, new_text: &str) -> Vec<Op> {
     // `anchor` is the id the next inserted character attaches after, i.e. the
     // last element that survives at this point in the new sequence.
     let mut anchor: Option<CharId> = None;
-    let mut oi = 0usize; // cursor into the old visible elements
+    // Cursor over the old visible elements. `Keep` and `Del` each consume one,
+    // `Ins` consumes none, so a forward iterator is all this needs — and it
+    // borrows `ids`, not `doc`, which is being mutated as we go.
+    let mut old_ids = ids.iter();
 
     for edit in script {
         match edit {
             Edit::Keep => {
-                anchor = Some(ids[oi]);
-                oi += 1;
+                anchor = old_ids.next();
             }
             Edit::Del => {
-                ops.push(doc.local_delete(ids[oi]));
-                oi += 1;
+                let id = old_ids.next().expect("edit script outran the document");
+                ops.push(doc.local_delete(id));
             }
             Edit::Ins(ch) => {
                 let op = doc.local_insert(anchor, ch);
