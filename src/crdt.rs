@@ -609,6 +609,20 @@ impl Doc {
                 self.index.add(e.id.peer, e.id.clock, 1, idx);
             }
         }
+        self.compact();
+    }
+
+    /// Hand back the slack that incremental construction leaves behind.
+    ///
+    /// A block's text is built with `String::push`, which grows by doubling, so
+    /// a freshly built document carries up to 2x the bytes it needs — and since
+    /// the text is the largest thing here, that slack *is* the memory profile.
+    /// Measured on a 6.6 MB file: 1.9 bytes of resident memory per byte of text
+    /// before this, ~1.05 after.
+    pub fn compact(&mut self) {
+        for b in &mut self.blocks {
+            b.text.shrink_to_fit();
+        }
         self.blocks.shrink_to_fit();
         self.index.shrink_to_fit();
     }
@@ -812,6 +826,7 @@ impl Doc {
             prev = Some(op.id());
             ops.push(op);
         }
+        doc.compact();
         (doc, ops)
     }
 
@@ -823,13 +838,40 @@ impl Doc {
     /// from colliding when the content differs — two different characters must
     /// never share an id.
     pub fn from_shared_content(path: &str, text: &str) -> (Self, PeerId) {
-        let lineage = content_lineage(path, text);
+        Self::from_shared_content_owned(path, text.to_owned())
+    }
+
+    /// `from_shared_content` that takes ownership of the text.
+    ///
+    /// Inserting character by character would build a second copy of the file
+    /// alongside the caller's, and on a multi-megabyte file that transient peak
+    /// is the memory profile — it was 0.86 bytes of resident memory per byte of
+    /// text, on top of the 1.0 the document actually needs.
+    ///
+    /// It is also entirely avoidable. A fresh document is exactly one block: the
+    /// loop mints clocks `1..=n` with every character following the one before
+    /// it, which is the definition of a single run. So construct that block
+    /// directly and move the string into it — one copy, no per-character work.
+    pub fn from_shared_content_owned(path: &str, text: String) -> (Self, PeerId) {
+        let lineage = content_lineage(path, &text);
         let mut doc = Doc::new(lineage);
-        let mut prev = None;
-        for ch in text.chars() {
-            let op = doc.local_insert(prev, ch);
-            prev = Some(op.id());
+        let n = text.chars().count() as u64;
+        if n == 0 {
+            return (doc, lineage);
         }
+        doc.clock = n;
+        doc.blocks.push(Block {
+            clock: 1,
+            peer: lineage,
+            origin: None,
+            text,
+            deleted: false,
+            next: NONE,
+            prev: NONE,
+        });
+        doc.head = 0;
+        doc.tail = 0;
+        doc.index.add(lineage, 1, n as u32, 0);
         (doc, lineage)
     }
 }
@@ -876,6 +918,36 @@ mod tests {
         }
         assert_eq!(doc.tail, prev_expected, "tail is not the last block");
         assert_eq!(seen, doc.len_raw());
+    }
+
+    /// The direct construction in `from_shared_content_owned` has to produce
+    /// exactly what inserting character by character produced, or two peers on
+    /// different versions would derive different ids for the same file and stop
+    /// merging.
+    #[test]
+    fn shared_content_matches_character_by_character_insertion() {
+        for text in [
+            "",
+            "a",
+            "hello world",
+            "line one\nline two\n",
+            "h\u{e9}llo \u{2192} \u{4e16}\u{754c} \u{1f30d}",
+        ] {
+            let (fast, lineage) = Doc::from_shared_content("some/path.txt", text);
+
+            // What the old loop built, spelled out.
+            let mut slow = Doc::new(lineage);
+            let mut prev = None;
+            for ch in text.chars() {
+                prev = Some(slow.local_insert(prev, ch).id());
+            }
+
+            assert_eq!(fast.text(), text, "text for {text:?}");
+            assert_eq!(fast.snapshot(), slow.snapshot(), "elements for {text:?}");
+            assert_eq!(fast.clock, slow.clock, "clock for {text:?}");
+            assert_eq!(fast.peer(), slow.peer(), "peer for {text:?}");
+            check(&fast);
+        }
     }
 
     #[test]

@@ -435,7 +435,7 @@ impl Engine {
                 // itself, so a peer that already holds these exact bytes builds
                 // an identical document and the two merge as a real CRDT
                 // instead of colliding as unrelated histories.
-                let (mut doc, base) = Doc::from_shared_content(&rel, &text);
+                let (mut doc, base) = Doc::from_shared_content_owned(&rel, text);
                 doc.set_peer(self.cfg.peer_id);
                 let entry = TextEntry { doc, base };
                 let snap = Msg::Snapshot {
@@ -448,7 +448,10 @@ impl Engine {
                 self.state.text.insert(rel.clone(), entry);
                 self.dirty = true;
                 if self.cfg.verbose {
-                    println!("[sync] new text file {rel} ({} chars)", text.chars().count());
+                    println!(
+                        "[sync] new text file {rel} ({} chars)",
+                        self.state.text[&rel].doc.len_visible()
+                    );
                 }
                 self.broadcast(Msg::FileCreate { path: rel, binary: false }, None);
                 self.broadcast(snap, None);
@@ -1121,7 +1124,7 @@ impl Engine {
                 continue;
             }
             let text = self.state.text[&path].doc.text();
-            let (mut doc, new_base) = Doc::from_shared_content(&path, &text);
+            let (mut doc, new_base) = Doc::from_shared_content_owned(&path, text);
             doc.set_peer(self.cfg.peer_id);
             if new_base == base {
                 continue; // already compact under this lineage
@@ -1312,7 +1315,7 @@ impl Engine {
                 None => {
                     // Content-derived lineage: two machines that were handed
                     // the same folder converge without a conflict copy.
-                    let (mut doc, base) = Doc::from_shared_content(&rel, &text);
+                    let (mut doc, base) = Doc::from_shared_content_owned(&rel, text);
                     doc.set_peer(self.cfg.peer_id);
                     self.state.text.insert(rel, TextEntry { doc, base });
                     self.dirty = true;
