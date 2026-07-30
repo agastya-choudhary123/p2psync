@@ -93,6 +93,17 @@ Two details that matter in practice:
 - **Relay with dedup.** A peer forwards operations it hasn't seen before to its
   other peers, so partial meshes converge. `Doc::apply` returns whether the op
   was new, and only new ops are relayed — that's what stops a forwarding loop.
+  New *files* are relayed the same way, and for a while they were not: ops were
+  forwarded but the `Snapshot` and `BinaryMeta` that carry a file's first
+  appearance were not, so in a chain `a—b—c` a file created at `a` reached `c`
+  only when the 30-second manifest sweep got round to it. Relaying those two is
+  conditional on the message having actually changed local state — there is no
+  op-level dedup to lean on, so "did this change anything?" is what has to
+  terminate the forwarding, and it does because CRDT merge is monotone: once a
+  peer holds the content, handling it again is a no-op and the relay stops.
+  `chain_topology_converges_quickly` builds a real chain (the older
+  `three_peer_mesh_converges` has every peer dialing every other, which is
+  exactly why this went unnoticed).
 
 ### Change detector (`src/diff.rs`)
 
@@ -284,7 +295,7 @@ disk.
 ## Tests
 
 ```bash
-cargo test              # 46 tests
+cargo test              # 47 tests
 ```
 
 - `tests/crdt.rs` — convergence and commutativity fuzzing, causal buffering,
@@ -293,8 +304,9 @@ cargo test              # 46 tests
   delta reconstruction fuzzing.
 - `tests/sync_e2e.rs` — two and three real engines on real sockets: both
   directions, incremental edits, echo suppression, simultaneous edits
-  converging on disk, binary delta, deletes, nested directories, TLS, and
-  reconnect-after-offline.
+  converging on disk, binary delta, deletes, nested directories, TLS,
+  reconnect-after-offline, and a three-peer *chain* — peer 3 dials only peer 2,
+  so a new file has to be relayed to reach it.
 - `tests/hardening.rs` — authentication (right secret, wrong secret, missing
   secret, and a real TLS-terminating MITM relay), independently-created files
   merging without a conflict copy, ignore rules, manifest catch-up, and
@@ -320,6 +332,33 @@ Each of these was a real limitation; each has a test that fails without the fix.
 - **Two copies of one file couldn't merge** → content-derived lineage, so the
   copy-a-folder-to-two-machines case is now a true CRDT merge.
 
+### Fixed in the second pass
+
+These four came from *running* the daemon rather than reading it — the test
+suite was green throughout, and stayed green while every one of them was live.
+
+- **New files reached indirect peers 1200x slower than direct ones.** In a chain
+  `a—b—c`, a file created at `a` took ~30 s to appear at `c` (the manifest
+  sweep) versus ~60 ms at `b`. Ops were relayed; the messages that carry a
+  file's first appearance were not. Now ~25 ms for text, ~95 ms for a binary.
+  The window was not just slow — it was long enough for `c` to independently
+  create the same path and produce a spurious `.conflict-` copy.
+- **Persisting state cost 100 MB of allocation.** `#[serde(into = "DocRepr")]`
+  clones the entire document — arena *and* id index — then builds a second copy
+  as `Vec<Elem>`, then encodes the whole thing to one `Vec<u8>`, every 2 seconds
+  while you type. Serialization now streams into the file. Resident memory for a
+  660 KB document: 178 MB → 95 MB, with the on-disk format unchanged (a state
+  file written by the old build still loads).
+- **A CRDT node was 64 bytes per character**, of which 24 were an
+  `Option<CharId>` origin that is recoverable from a `u32` slot index. Now 36.
+- **A rejected peer retried once a second forever.** Found by noticing a daemon
+  from an earlier session still knocking after 6h22m. Now exponential to a 30 s
+  cap with jitter: 60 attempts/minute → 5. The subtlety is what counts as
+  success — a wrong-secret peer *does* complete its TCP connect and fails at the
+  handshake, so resetting the backoff there would have fixed nothing. Only a
+  link that survived a few seconds counts, which keeps reconnect after a genuine
+  peer restart at ~25 ms.
+
 ### Still real
 
 - **RGA can interleave** two peers typing *different words at the identical
@@ -341,6 +380,18 @@ Each of these was a real limitation; each has a test that fails without the fix.
   vectors and an op log would fix it.
 - **Per-edit work is O(file size)** regardless of the CRDT: every save re-reads
   the file, diffs it, and rewrites it on the far side. Fine to a few hundred KB.
+- **Memory is roughly 145x the text it is syncing.** A 660 KB file costs about
+  95 MB resident (an empty directory costs 5.5 MB). That is down from 178 MB —
+  see below — but it is still the hard ceiling on file size, and a few MB of
+  text would run to gigabytes. One character costs a 36-byte arena node plus its
+  entry in the `id -> slot` index; the index is now the larger half, and getting
+  meaningfully below this means not keeping every character's id resident.
+- **The state file is ~77 bytes per character**, so a 660 KB document persists as
+  a 50 MB `.p2psync/state.msgpack`, rewritten in full every 2 seconds while you
+  type. Serialization streams now, so it no longer costs 100 MB of allocation to
+  write, but the file itself is still enormous: it stores every element's id and
+  origin under MessagePack field *names*. A compact encoding and an incremental
+  write are both open.
 - **`--secret` over plaintext is authorization only.** With no certificate there
   is nothing to bind to, so an active MITM is still possible; the process says so
   on startup. Use `--tls`.

@@ -145,8 +145,8 @@ struct DocRepr {
 }
 
 /// One CRDT document — the state of a single text file.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(from = "DocRepr", into = "DocRepr")]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(from = "DocRepr")]
 pub struct Doc {
     arena: Vec<Node>,
     head: Option<u32>,
@@ -172,13 +172,37 @@ impl From<DocRepr> for Doc {
     }
 }
 
-impl From<Doc> for DocRepr {
-    fn from(d: Doc) -> Self {
-        DocRepr {
-            elems: d.snapshot(),
-            clock: d.clock,
-            peer: d.peer,
+/// Serialize straight out of the arena, emitting exactly the `DocRepr` shape.
+///
+/// The obvious `#[serde(into = "DocRepr")]` is what this replaces, and it was
+/// ruinous: serde's `into` clones the whole `Doc` — arena *and* slot index —
+/// and then `DocRepr` materializes a second copy as `Vec<Elem>`, all before a
+/// byte is written. For a 660 KB file that was over 100 MB of allocation every
+/// time the state was persisted, which happens every two seconds while the user
+/// is typing. Streaming the elements costs one `Elem` at a time.
+impl Serialize for Doc {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = s.serialize_struct("DocRepr", 3)?;
+        st.serialize_field("elems", &ElemSeq(self))?;
+        st.serialize_field("clock", &self.clock)?;
+        st.serialize_field("peer", &self.peer)?;
+        st.end()
+    }
+}
+
+/// The `elems` field of a `DocRepr`, rendered without ever holding the whole
+/// `Vec<Elem>` in memory.
+struct ElemSeq<'a>(&'a Doc);
+
+impl Serialize for ElemSeq<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = s.serialize_seq(Some(self.0.arena.len()))?;
+        for node in self.0.iter_nodes() {
+            seq.serialize_element(&node.to_elem(&self.0.arena))?;
         }
+        seq.end()
     }
 }
 
@@ -217,32 +241,42 @@ impl Doc {
         }
     }
 
-    /// Walk the list in document order.
-    /// Returns cloned Elem to avoid lifetime issues with the reconstruction.
-    fn iter(&self) -> impl Iterator<Item = Elem> + '_ {
+    /// Walk the list in document order, borrowing the nodes.
+    ///
+    /// This is the hot path — `text()` runs on every edit and every write — so
+    /// it deliberately does *not* rebuild an `Elem`. Reconstructing the origin
+    /// costs a random arena lookup per character, which is pure waste for the
+    /// callers that only want `ch` or `id`.
+    fn iter_nodes(&self) -> impl Iterator<Item = &Node> {
         let mut cur = self.head;
         let arena = &self.arena;
         std::iter::from_fn(move || {
             let i = cur?;
             let node = &arena[i as usize];
             cur = if node.next == NONE_SLOT { None } else { Some(node.next) };
-            Some(node.to_elem(arena))
+            Some(node)
         })
+    }
+
+    /// Walk the list in document order as serializable `Elem`s, rebuilding each
+    /// element's origin id from its slot. Only serialization needs this.
+    fn iter(&self) -> impl Iterator<Item = Elem> + '_ {
+        self.iter_nodes().map(|n| n.to_elem(&self.arena))
     }
 
     /// Visible (non-tombstoned) characters as a string.
     pub fn text(&self) -> String {
-        self.iter().filter(|e| !e.deleted).map(|e| e.ch).collect()
+        self.iter_nodes().filter(|n| !n.deleted).map(|n| n.ch).collect()
     }
 
     /// Ids of the visible characters, in order. Used by the change detector to
     /// map diff positions back onto CRDT elements.
     pub fn visible_ids(&self) -> Vec<CharId> {
-        self.iter().filter(|e| !e.deleted).map(|e| e.id).collect()
+        self.iter_nodes().filter(|n| !n.deleted).map(|n| n.id).collect()
     }
 
     pub fn len_visible(&self) -> usize {
-        self.iter().filter(|e| !e.deleted).count()
+        self.iter_nodes().filter(|n| !n.deleted).count()
     }
 
     /// Elements in document order, tombstones included.
@@ -361,8 +395,17 @@ impl Doc {
             self.clock = self.clock.max(elem.id.clock);
             self.slot.insert(elem.id, i);
 
-            // Look up origin slot
-            let origin_slot = elem.origin.map(|o| self.slot[&o]).unwrap_or(NONE_SLOT);
+            // Resolve the origin to a slot. An origin always precedes its
+            // element in document order, so it is already in `slot` — but this
+            // document arrives over the network, and indexing a missing key
+            // would let any peer panic the daemon with a dangling origin.
+            // Falling back to "start of document" keeps a malformed snapshot
+            // from taking the process down; ordering of a corrupt element was
+            // undefined anyway.
+            let origin_slot = elem
+                .origin
+                .and_then(|o| self.slot.get(&o).copied())
+                .unwrap_or(NONE_SLOT);
 
             let prev = if i == 0 { NONE_SLOT } else { i - 1 };
             let next = if i as usize + 1 == n { NONE_SLOT } else { i + 1 };

@@ -705,16 +705,17 @@ impl Engine {
                 let mut doc = Doc::new(self.cfg.peer_id);
                 doc.adopt(elems);
                 let text = doc.text();
-                let entry = TextEntry { doc, base };
-                self.state.text.insert(path.clone(), entry.clone());
+                self.state.text.insert(path.clone(), TextEntry { doc, base });
                 self.write_file(&path, text.as_bytes())?;
                 self.dirty = true;
                 println!("[recv] new file {path} from {} ({} chars)", format_id(from), text.chars().count());
-                // Relay this new file to our other peers so it propagates through the network.
+                // Relay this new file to our other peers so it propagates through
+                // the network. Snapshot straight out of the map: cloning the
+                // `TextEntry` here would duplicate the whole arena and slot index.
                 self.broadcast(
                     Msg::Snapshot {
                         path: path.clone(),
-                        elems: entry.doc.snapshot(),
+                        elems: self.state.text[&path].doc.snapshot(),
                         text_hash: text_hash.clone(),
                         base,
                         mtime_ms: mtime_ms(&self.cfg.root.join(&path)),
@@ -1218,8 +1219,11 @@ impl Engine {
     }
 
     fn load_state(&mut self) {
-        let Ok(bytes) = std::fs::read(self.state_path()) else { return };
-        match rmp_serde::from_slice::<State>(&bytes) {
+        // Read through a buffer rather than slurping the whole file: the state
+        // is far larger than the documents it describes.
+        let Ok(file) = std::fs::File::open(self.state_path()) else { return };
+        let rd = std::io::BufReader::new(file);
+        match rmp_serde::from_read::<_, State>(rd) {
             Ok(mut s) => {
                 // Documents keep their persisted ids; only the local minting
                 // identity is rebound to this process's peer id.
@@ -1237,11 +1241,26 @@ impl Engine {
         }
     }
 
+    /// Persist to a temp file and rename, so a crash mid-write can't truncate
+    /// the real state file.
+    ///
+    /// Serialization streams into the file rather than building the whole
+    /// encoding in memory first: this state is tens of megabytes for a document
+    /// of a few hundred KB, and it is rewritten every two seconds while the user
+    /// types. `to_vec_named` held all of it as one `Vec<u8>`.
     fn save_state(&mut self) {
-        let Ok(bytes) = rmp_serde::to_vec_named(&self.state) else { return };
+        use serde::Serialize;
+        use std::io::Write;
+
         let p = self.state_path();
         let tmp = p.with_extension("tmp");
-        if std::fs::write(&tmp, &bytes).is_ok() {
+        let Ok(file) = std::fs::File::create(&tmp) else { return };
+        let mut wr = std::io::BufWriter::new(file);
+        // `with_struct_map` keeps the field-name encoding `to_vec_named`
+        // produced, so state files written by older builds still load.
+        let mut ser = rmp_serde::Serializer::new(&mut wr).with_struct_map();
+        if self.state.serialize(&mut ser).is_ok() && wr.flush().is_ok() {
+            drop(wr);
             let _ = std::fs::rename(&tmp, &p);
         }
         self.dirty = false;
@@ -1413,14 +1432,14 @@ fn spawn_dialer(
             if !already {
                 if let Ok(s) = net::connect(&addr, tls.as_ref()).await {
                     live.lock().await.insert(addr.clone());
-                    // Mark successful connection in backoff state.
-                    {
-                        let mut states = backoff_states.lock().await;
-                        let state = states.entry(addr.clone()).or_insert_with(DialerState::new);
-                        state.on_success();
-                    }
-
-                    if let Err(e) = pump(
+                    // Time the link. Reaching the far end's TCP port is *not*
+                    // success on its own: a peer with the wrong secret accepts
+                    // the connection and then rejects the handshake in
+                    // milliseconds. Resetting the backoff there would leave a
+                    // misconfigured pair hammering each other forever, which is
+                    // the exact behavior this backoff exists to stop.
+                    let started = std::time::Instant::now();
+                    let outcome = pump(
                         s,
                         me.clone(),
                         ev_tx.clone(),
@@ -1428,18 +1447,31 @@ fn spawn_dialer(
                         Role::Initiator,
                         secret.clone(),
                     )
-                    .await
+                    .await;
+                    let lasted = started.elapsed();
                     {
-                        let error_msg = format!("{e:#}");
                         let mut states = backoff_states.lock().await;
                         let state = states.entry(addr.clone()).or_insert_with(DialerState::new);
-                        state.log_error(&addr, &error_msg);
-                        state.on_failure();
+                        match outcome {
+                            Ok(()) => state.on_success(),
+                            Err(e) => {
+                                state.log_error(&addr, &format!("{e:#}"));
+                                // A link that carried traffic for a while and
+                                // then dropped is a healthy peer going away —
+                                // redial it promptly. One that dies immediately
+                                // is a misconfiguration; back off.
+                                if lasted >= Duration::from_secs(5) {
+                                    state.on_success();
+                                } else {
+                                    state.on_failure();
+                                }
+                            }
+                        }
                     }
                     live.lock().await.remove(&addr);
                 } else {
                     // Connection failed to establish.
-                    let error_msg = format!("connection refused");
+                    let error_msg = "connection refused";
                     let mut states = backoff_states.lock().await;
                     let state = states.entry(addr.clone()).or_insert_with(DialerState::new);
                     state.log_error(&addr, &error_msg);
