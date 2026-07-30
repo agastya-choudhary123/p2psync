@@ -704,19 +704,53 @@ impl Engine {
                 let mut doc = Doc::new(self.cfg.peer_id);
                 doc.adopt(elems);
                 let text = doc.text();
-                self.state.text.insert(path.clone(), TextEntry { doc, base });
+                let entry = TextEntry { doc, base };
+                self.state.text.insert(path.clone(), entry.clone());
                 self.write_file(&path, text.as_bytes())?;
                 self.dirty = true;
                 println!("[recv] new file {path} from {} ({} chars)", format_id(from), text.chars().count());
+                // Relay this new file to our other peers so it propagates through the network.
+                self.broadcast(
+                    Msg::Snapshot {
+                        path: path.clone(),
+                        elems: entry.doc.snapshot(),
+                        text_hash: text_hash.clone(),
+                        base,
+                        mtime_ms: mtime_ms(&self.cfg.root.join(&path)),
+                    },
+                    Some(from),
+                );
             }
             // Same lineage: a real CRDT merge.
             Some(entry) if entry.base == base => {
+                let old_text = entry.doc.text();
                 entry.doc.merge_snapshot(&elems);
                 let text = entry.doc.text();
+                let text_changed = text != old_text;
+                // Save snapshot before write_file to avoid borrow conflicts.
+                let entry_snapshot = if text_changed {
+                    Some(entry.doc.snapshot())
+                } else {
+                    None
+                };
                 self.write_file(&path, text.as_bytes())?;
                 self.dirty = true;
                 if self.cfg.verbose {
                     println!("[recv] merged snapshot {path} from {}", format_id(from));
+                }
+                // Relay the merged snapshot only if the visible text actually changed as a result.
+                if let Some(snapshot) = entry_snapshot {
+                    let new_hash = binary::sha256_hex(text.as_bytes());
+                    self.broadcast(
+                        Msg::Snapshot {
+                            path: path.clone(),
+                            elems: snapshot,
+                            text_hash: new_hash,
+                            base,
+                            mtime_ms: mtime_ms(&self.cfg.root.join(&path)),
+                        },
+                        Some(from),
+                    );
                 }
             }
             // Two independent histories for the same path. Merging disjoint id
@@ -754,10 +788,24 @@ impl Engine {
                     );
                 } else {
                     let remote_text = self.state.text.get(&path).unwrap().doc.text();
+                    // Get snapshot before write_file to avoid borrow conflicts.
+                    let entry_snapshot = self.state.text.get(&path).unwrap().doc.snapshot();
+                    let remote_hash = binary::sha256_hex(remote_text.as_bytes());
                     let conflict = format!("{path}.conflict-{}", format_id(self.cfg.peer_id));
                     println!("[recv] {path}: remote is newer; local copy saved as {conflict}");
                     self.write_file(&conflict, local_text.as_bytes())?;
                     self.write_file(&path, remote_text.as_bytes())?;
+                    // Relay the remote snapshot to our other peers so they also adopt it.
+                    self.broadcast(
+                        Msg::Snapshot {
+                            path: path.clone(),
+                            elems: entry_snapshot,
+                            text_hash: remote_hash,
+                            base,
+                            mtime_ms: mtime_ms(&self.cfg.root.join(&path)),
+                        },
+                        Some(from),
+                    );
                 }
             }
         }
@@ -854,16 +902,34 @@ impl Engine {
         }
         self.write_file(&path, &rebuilt)?;
         let version = version.max(self.state.bin.get(&path).map(|b| b.version).unwrap_or(0));
+
+        // Check if the hash changed from what we had before.
+        let hash_changed = self.state.bin.get(&path).map(|b| &b.hash) != Some(&hash);
+
         self.state.bin.insert(
             path.clone(),
             BinEntry {
-                hash,
+                hash: hash.clone(),
                 len: rebuilt.len() as u64,
                 version,
             },
         );
         self.dirty = true;
         println!("[recv] binary {path} ({} bytes) from {}", rebuilt.len(), format_id(from));
+
+        // Relay the binary metadata to our other peers if the content actually changed.
+        // This allows peers not directly connected to the sender to discover and fetch the file.
+        if hash_changed {
+            self.broadcast(
+                Msg::BinaryMeta {
+                    path: path.clone(),
+                    hash,
+                    len: rebuilt.len() as u64,
+                    version,
+                },
+                Some(from),
+            );
+        }
         Ok(())
     }
 
