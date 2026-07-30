@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, Mutex};
+use rand::Rng;
 
 /// How long a delete waits before being broadcast, so that a delete+create
 /// pair can be recognized as a rename instead.
@@ -1312,6 +1313,87 @@ pub fn format_id(id: PeerId) -> String {
     format!("{:08x}", id & 0xffff_ffff)
 }
 
+/// Per-address backoff and error tracking state.
+struct DialerState {
+    /// Current backoff delay in milliseconds.
+    delay_ms: u64,
+    /// Number of consecutive failures.
+    consecutive_failures: u64,
+    /// Last error message we logged (to suppress repeats).
+    last_error: Option<String>,
+    /// Number of identical errors suppressed since the last log.
+    suppressed_count: u64,
+}
+
+impl DialerState {
+    fn new() -> Self {
+        DialerState {
+            delay_ms: 1000,
+            consecutive_failures: 0,
+            last_error: None,
+            suppressed_count: 0,
+        }
+    }
+
+    /// Reset backoff on successful connection.
+    fn on_success(&mut self) {
+        self.delay_ms = 1000;
+        self.consecutive_failures = 0;
+        // Don't reset last_error/suppressed_count so we can detect transitions.
+    }
+
+    /// Update delay on failure, with exponential backoff capped at 30s.
+    fn on_failure(&mut self) {
+        self.consecutive_failures += 1;
+        // Exponential backoff: 1s, 2s, 4s, 8s, 16s, 30s, 30s...
+        self.delay_ms = (self.delay_ms * 2).min(30_000);
+    }
+
+    /// Get the sleep duration with jitter (+/- 10-20%).
+    fn get_delay_with_jitter(&self) -> Duration {
+        let mut rng = rand::thread_rng();
+        // Jitter: +/- 15% (10-20% range)
+        let jitter_pct = rng.gen_range(85..=115) as f64 / 100.0;
+        let jittered_ms = (self.delay_ms as f64 * jitter_pct) as u64;
+        Duration::from_millis(jittered_ms)
+    }
+
+    /// Log the error, suppressing repeats.
+    fn log_error(&mut self, addr: &str, error: &str) {
+        let error_str = error.to_string();
+        if self.last_error.as_ref() == Some(&error_str) {
+            // Same error as before; suppress and count.
+            self.suppressed_count += 1;
+        } else {
+            // Different error or first time; emit any suppression summary and log the new one.
+            if let Some(prev) = self.last_error.take() {
+                if self.suppressed_count > 0 {
+                    eprintln!(
+                        "[net] {}: still unreachable ({} attempts suppressed, error: {})",
+                        addr, self.suppressed_count, prev
+                    );
+                }
+            }
+            eprintln!("[net] {}: {}", addr, error_str);
+            self.last_error = Some(error_str);
+            self.suppressed_count = 0;
+        }
+    }
+
+    /// Emit a periodic summary of suppressed errors.
+    fn log_suppression_summary(&mut self, addr: &str) {
+        if let Some(error) = &self.last_error {
+            if self.suppressed_count > 0 {
+                eprintln!(
+                    "[net] {}: still unreachable ({} attempts suppressed, error: {})",
+                    addr, self.suppressed_count, error
+                );
+                self.suppressed_count = 0;
+            }
+        }
+    }
+}
+
 /// Keep one outbound connection to `addr` alive, retrying after it drops.
 ///
 /// This is what makes reconnect-after-offline work: the dialer keeps knocking,
@@ -1325,11 +1407,19 @@ fn spawn_dialer(
     secret: Option<Vec<u8>>,
 ) {
     tokio::spawn(async move {
+        let backoff_states = Arc::new(Mutex::new(HashMap::<String, DialerState>::new()));
         loop {
             let already = live.lock().await.contains(&addr);
             if !already {
                 if let Ok(s) = net::connect(&addr, tls.as_ref()).await {
                     live.lock().await.insert(addr.clone());
+                    // Mark successful connection in backoff state.
+                    {
+                        let mut states = backoff_states.lock().await;
+                        let state = states.entry(addr.clone()).or_insert_with(DialerState::new);
+                        state.on_success();
+                    }
+
                     if let Err(e) = pump(
                         s,
                         me.clone(),
@@ -1340,12 +1430,42 @@ fn spawn_dialer(
                     )
                     .await
                     {
-                        eprintln!("[net] {addr}: {e:#}");
+                        let error_msg = format!("{e:#}");
+                        let mut states = backoff_states.lock().await;
+                        let state = states.entry(addr.clone()).or_insert_with(DialerState::new);
+                        state.log_error(&addr, &error_msg);
+                        state.on_failure();
                     }
                     live.lock().await.remove(&addr);
+                } else {
+                    // Connection failed to establish.
+                    let error_msg = format!("connection refused");
+                    let mut states = backoff_states.lock().await;
+                    let state = states.entry(addr.clone()).or_insert_with(DialerState::new);
+                    state.log_error(&addr, &error_msg);
+                    state.on_failure();
                 }
             }
-            tokio::time::sleep(Duration::from_millis(1000)).await;
+
+            // Get the backoff delay with jitter.
+            let delay = {
+                let mut states = backoff_states.lock().await;
+                let state = states.entry(addr.clone()).or_insert_with(DialerState::new);
+                state.get_delay_with_jitter()
+            };
+
+            // Periodically emit suppression summaries (roughly every 30+ seconds).
+            tokio::time::sleep(delay).await;
+
+            // After the delay, emit a summary if many errors were suppressed.
+            {
+                let mut states = backoff_states.lock().await;
+                if let Some(state) = states.get_mut(&addr) {
+                    if state.suppressed_count > 10 {
+                        state.log_suppression_summary(&addr);
+                    }
+                }
+            }
         }
     });
 }
