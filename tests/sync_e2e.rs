@@ -233,6 +233,60 @@ async fn three_peer_mesh_converges() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chain_topology_converges_quickly() {
+    // Regression test for relay of new files through indirect peers.
+    // Topology: peer1 <-> peer2 <-> peer3 (peer3 ONLY dials peer2, not peer1)
+    // This ensures files are relayed through the chain, not just exchanged via manifest.
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+
+    // Peer 1 listens, peer 2 dials peer 1, peer 3 dials only peer 2 (chain, not mesh).
+    spawn_peer(dirs[0].path().to_path_buf(), 91, 17891, vec![]);
+    spawn_peer(dirs[1].path().to_path_buf(), 92, 17892, vec!["127.0.0.1:17891".into()]);
+    spawn_peer(dirs[2].path().to_path_buf(), 93, 17893, vec!["127.0.0.1:17892".into()]);
+
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    // Test 1: new text file created at one end reaches the far end quickly.
+    std::fs::write(dirs[0].path().join("chain_text.txt"), "file at chain start\n").unwrap();
+    // Should reach peer2 (direct connection) very fast (~60ms).
+    expect_content(
+        &dirs[1].path().join("chain_text.txt"),
+        "file at chain start\n",
+        Duration::from_secs(2),
+    )
+    .await;
+    // Should reach peer3 (indirect, through peer2) quickly via relay, much faster than 30s.
+    expect_content(
+        &dirs[2].path().join("chain_text.txt"),
+        "file at chain start\n",
+        Duration::from_secs(8),
+    )
+    .await;
+
+    // Test 2: new binary file created at one end reaches the far end quickly.
+    let mut binary_content = vec![0u8; 4096];
+    binary_content[0] = 0xDE;
+    binary_content[1] = 0xAD;
+    binary_content[2] = 0xBE;
+    binary_content[3] = 0xEF;
+    std::fs::write(dirs[0].path().join("chain_bin.bin"), &binary_content).unwrap();
+    // Should reach peer2 quickly.
+    expect_bytes(
+        &dirs[1].path().join("chain_bin.bin"),
+        &binary_content,
+        Duration::from_secs(2),
+    )
+    .await;
+    // Should reach peer3 through relay.
+    expect_bytes(
+        &dirs[2].path().join("chain_bin.bin"),
+        &binary_content,
+        Duration::from_secs(8),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tls_link_syncs() {
     let a = tempfile::tempdir().unwrap();
     let b = tempfile::tempdir().unwrap();
