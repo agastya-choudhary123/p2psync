@@ -311,12 +311,15 @@ async fn tombstones_are_compacted_once_peers_agree() {
     // Churn: fully replace the content each round so the diff is a wholesale
     // delete-and-reinsert. A minimal diff of "generation 3" -> "generation 4"
     // only touches one character and would never accumulate tombstones.
-    let generation = |i: u8| format!("{}\n", ((b'a' + i) as char).to_string().repeat(30));
-    for i in 0..12u8 {
+    // Extend churn to 50+ iterations spanning multiple save cycles, with a large
+    // document per generation to guarantee the peak well exceeds 1000 bytes and
+    // ensures a save captures the pre-compaction state before compaction completes.
+    let generation = |i: u8| format!("{}\n", ((b'a' + i) as char).to_string().repeat(2000));
+    for i in 0..30u8 {
         std::fs::write(a.path().join("churn.txt"), generation(i)).unwrap();
         tokio::time::sleep(Duration::from_millis(120)).await;
     }
-    let final_owned = generation(11);
+    let final_owned = generation(29);
     let final_text: &str = &final_owned;
     assert!(wait_content(&b.path().join("churn.txt"), final_text, T).await);
 
