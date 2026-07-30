@@ -31,6 +31,7 @@
 //! Reconstruction happens on demand via `Node::to_elem()` during serialization.
 
 use serde::{Deserialize, Serialize};
+use crate::slotindex::SlotIndex;
 use std::collections::{HashMap, HashSet};
 
 pub type PeerId = u64;
@@ -82,7 +83,7 @@ impl Op {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Elem {
     pub id: CharId,
     pub origin: Option<CharId>,
@@ -139,6 +140,7 @@ impl Node {
 /// rebuilt on load, so the on-disk format doesn't depend on arena layout.
 #[derive(Serialize, Deserialize)]
 struct DocRepr {
+    #[serde(with = "crate::elemcodec")]
     elems: Vec<Elem>,
     clock: u64,
     peer: PeerId,
@@ -152,7 +154,7 @@ pub struct Doc {
     head: Option<u32>,
     tail: Option<u32>,
     /// id -> arena slot. Doubles as the "have we seen this id" set.
-    slot: HashMap<CharId, u32>,
+    slot: SlotIndex,
     /// Lamport clock for locally generated ids.
     clock: u64,
     /// This replica's id (used when minting new character ids).
@@ -183,26 +185,12 @@ impl From<DocRepr> for Doc {
 impl Serialize for Doc {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
+        let blob = crate::elemcodec::encode_streaming(|| self.iter());
         let mut st = s.serialize_struct("DocRepr", 3)?;
-        st.serialize_field("elems", &ElemSeq(self))?;
+        st.serialize_field("elems", &serde_bytes::ByteBuf::from(blob))?;
         st.serialize_field("clock", &self.clock)?;
         st.serialize_field("peer", &self.peer)?;
         st.end()
-    }
-}
-
-/// The `elems` field of a `DocRepr`, rendered without ever holding the whole
-/// `Vec<Elem>` in memory.
-struct ElemSeq<'a>(&'a Doc);
-
-impl Serialize for ElemSeq<'_> {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeSeq;
-        let mut seq = s.serialize_seq(Some(self.0.arena.len()))?;
-        for node in self.0.iter_nodes() {
-            seq.serialize_element(&node.to_elem(&self.0.arena))?;
-        }
-        seq.end()
     }
 }
 
@@ -212,7 +200,7 @@ impl Doc {
             arena: Vec::new(),
             head: None,
             tail: None,
-            slot: HashMap::new(),
+            slot: SlotIndex::new(),
             clock: 0,
             peer,
             pending: HashMap::new(),
@@ -341,7 +329,7 @@ impl Doc {
                 true
             }
             Op::Delete { id } => match self.slot.get(&id) {
-                Some(&i) => {
+                Some(i) => {
                     let was = self.arena[i as usize].deleted;
                     self.arena[i as usize].deleted = true;
                     !was
@@ -388,23 +376,30 @@ impl Doc {
     pub fn adopt(&mut self, elems: Vec<Elem>) {
         let n = elems.len();
         self.arena = Vec::with_capacity(n);
-        self.slot = HashMap::with_capacity(n);
         self.clock = 0;
+        // Index the whole document in one pass. Document order is not clock
+        // order once a document has been merged, so feeding these ids in one at
+        // a time would insert into the middle of the run vector repeatedly;
+        // building in bulk sorts once instead.
+        self.slot.build(
+            elems
+                .iter()
+                .enumerate()
+                .map(|(i, e)| (e.id, i as u32)),
+        );
         for (i, elem) in elems.into_iter().enumerate() {
             let i = i as u32;
             self.clock = self.clock.max(elem.id.clock);
-            self.slot.insert(elem.id, i);
 
             // Resolve the origin to a slot. An origin always precedes its
-            // element in document order, so it is already in `slot` — but this
-            // document arrives over the network, and indexing a missing key
-            // would let any peer panic the daemon with a dangling origin.
+            // element in document order — but this document arrives over the
+            // network, and a dangling origin must not panic the daemon.
             // Falling back to "start of document" keeps a malformed snapshot
             // from taking the process down; ordering of a corrupt element was
             // undefined anyway.
             let origin_slot = elem
                 .origin
-                .and_then(|o| self.slot.get(&o).copied())
+                .and_then(|o| self.slot.get(&o))
                 .unwrap_or(NONE_SLOT);
 
             let prev = if i == 0 { NONE_SLOT } else { i - 1 };
@@ -426,8 +421,8 @@ impl Doc {
     /// concurrent-and-later replicas would have placed ahead of us. The first
     /// element with a *smaller* id than ours is our insertion point.
     fn integrate_insert(&mut self, id: CharId, origin: Option<CharId>, ch: char) {
-        let origin_slot = origin.map(|o| self.slot[&o]).unwrap_or(NONE_SLOT);
-        let mut prev = origin.map(|o| self.slot[&o]);
+        let origin_slot = origin.and_then(|o| self.slot.get(&o)).unwrap_or(NONE_SLOT);
+        let mut prev = origin.and_then(|o| self.slot.get(&o));
         let mut next = match prev {
             Some(p) => {
                 let p_next = self.arena[p as usize].next;

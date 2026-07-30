@@ -49,6 +49,7 @@ pub enum Msg {
     /// matches `text_hash`.
     Checkpoint {
         path: String,
+        #[serde(with = "crate::elemcodec")]
         elems: Vec<Elem>,
         base: PeerId,
         text_hash: String,
@@ -65,6 +66,7 @@ pub enum Msg {
     /// Full CRDT state for one text file, sent on connect for catch-up.
     Snapshot {
         path: String,
+        #[serde(with = "crate::elemcodec")]
         elems: Vec<Elem>,
         /// Hash of the visible text, so the receiver can skip identical docs.
         text_hash: String,

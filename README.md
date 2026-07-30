@@ -81,8 +81,14 @@ hash map from id to slot. The obvious first implementation — a flat `Vec` with
 linear search — is quadratic in document length: loading a 220 KB file took
 **17.9 seconds**, because each of 220,000 inserts scanned and memmoved the whole
 vector. The arena makes origin lookup and splicing O(1), bringing that to
-**27.8 ms**. The only forward scan left is across the handful of *concurrent*
+**20.0 ms**. The only forward scan left is across the handful of *concurrent*
 siblings competing for one position.
+
+The id-to-slot lookup is not a hash map. It stores *runs*: sequential typing
+produces consecutive clocks landing in consecutive slots, so one run covers a
+whole file, and a lookup is a binary search plus arithmetic. As a
+`HashMap<CharId, u32>` this index measured 41 MB for a 660 KB document —
+larger than the arena it indexed. See `src/slotindex.rs`.
 
 Two details that matter in practice:
 
@@ -266,7 +272,7 @@ before and after the arena rewrite:
 | 3 K chars | 0.6ms | 0.2ms | 0.015ms | 0.3ms |
 | 12 K chars | 49.5ms | 1.7ms | 0.109ms | 0.4ms |
 | 56 K chars | 1,072ms | 7.9ms | 0.514ms | 0.8ms |
-| 221 K chars | 17,884ms | **27.8ms** | 2.5ms | 1.9ms |
+| 221 K chars | 17,884ms | **20.0ms** | 2.4ms | 2.1ms |
 
 Loading is now linear rather than quadratic. Single-character edits got slightly
 slower (1.6ms → 2.5ms at 221 K chars) because walking a linked list has worse
@@ -282,6 +288,31 @@ stall.
 | 10 | 58.1ms | 16.6ms |
 
 Fan-out is per-peer serialization, so 10 peers costs ~1ms more than 3.
+
+**Footprint** — a 660 KB text file, measured end to end. Every one of these
+numbers is the same root cause: a character carries two 16-byte `CharId`s, its
+own and its origin's.
+
+| | before | after |
+|---|---|---|
+| bytes on the wire to sync a 108 KB file | 3.44 MB (31.6x) | **218 KB (2.0x)** |
+| `.p2psync/state.msgpack` | 50.6 MB (77x) | **1.3 MB (2.0x)** |
+| resident memory | 178 MB | **37.5 MB** |
+| propagation latency while syncing it | p50 57ms, spikes to 117ms | **p50 57ms, max 60ms** |
+
+Three changes, in order of what they bought. `src/elemcodec.rs` encodes an
+element sequence as runs — sequential text costs a flags byte and the UTF-8 of
+the character, two bytes rather than 45 — and is used for both the wire and the
+state file. `src/slotindex.rs` replaces the `HashMap<CharId, u32>` with the same
+run idea, which mattered more than it sounds: `heap` showed that index at 41 MB,
+*larger than the 26 MB arena it indexed*. And state serialization streams
+instead of building the whole encoding in memory.
+
+The latency spikes were the state file: 50 MB written synchronously every two
+seconds, landing on top of whatever edit was in flight. At 1.3 MB they are gone.
+
+TLS costs 0.2% on top of that (2,260 bytes versus 2,254 for a small sync), so
+encryption was never the expense — encrypting 31x more bytes than necessary was.
 
 **Recovery** — a cold peer joining after missing 200 edits (6,096 bytes) caught
 up in **4.5ms** and streamed normally afterwards.
@@ -380,21 +411,28 @@ suite was green throughout, and stayed green while every one of them was live.
   vectors and an op log would fix it.
 - **Per-edit work is O(file size)** regardless of the CRDT: every save re-reads
   the file, diffs it, and rewrites it on the far side. Fine to a few hundred KB.
-- **Memory is roughly 145x the text it is syncing.** A 660 KB file costs about
-  95 MB resident (an empty directory costs 5.5 MB). That is down from 178 MB —
-  see below — but it is still the hard ceiling on file size, and a few MB of
-  text would run to gigabytes. One character costs a 36-byte arena node plus its
-  entry in the `id -> slot` index; the index is now the larger half, and getting
-  meaningfully below this means not keeping every character's id resident.
-- **The state file is ~77 bytes per character**, so a 660 KB document persists as
-  a 50 MB `.p2psync/state.msgpack`, rewritten in full every 2 seconds while you
-  type. Serialization streams now, so it no longer costs 100 MB of allocation to
-  write, but the file itself is still enormous: it stores every element's id and
-  origin under MessagePack field *names*. A compact encoding and an incremental
-  write are both open.
+- **Memory is still ~57x the text it is syncing.** A 660 KB file costs 37.5 MB
+  resident, down from 178 MB, but an empty directory costs 5.5 MB and the
+  remainder is the arena: one 40-byte node per character, and 40 is what
+  `CharId` (two `u64`s) forces once alignment is counted. Getting below this
+  needs block-wise elements — one node per *run* of characters rather than one
+  per character, the way Yjs and Automerge store text — which is a redesign of
+  `Doc`, not a tweak.
+- **The state file is rewritten whole every 2 seconds** while you are typing.
+  It is 2.0x the document now rather than 77x, so that is 1.3 MB rather than
+  50 MB per write, but it is still the entire document each time. An op log with
+  periodic compaction would make it incremental.
 - **`--secret` over plaintext is authorization only.** With no certificate there
   is nothing to bind to, so an active MITM is still possible; the process says so
   on startup. Use `--tls`.
+- **Encryption is opt-in, and the default is not it.** Without `--tls` the
+  contents cross the wire in the clear. Verified rather than assumed, with a
+  relay between two peers: in the default mode the synced text is recoverable
+  straight off the socket, and with `--tls` the stream is TLS records and
+  nothing is recoverable. Note that a naive `grep` of the traffic finds nothing
+  either way — the CRDT ships one element per character, so the text is never
+  contiguous on the wire. That is not encryption, and it should not be mistaken
+  for it.
 - **No NAT traversal.** mDNS covers a LAN; anything else needs manual
   `--peer host:port` and reachable ports.
 - **Untested territory:** two physically separate machines, Linux/inotify (the
@@ -407,6 +445,8 @@ suite was green throughout, and stayed green while every one of them was live.
 ```
 src/crdt.rs      RGA: CharId, Op, Doc, arena + linked list, causal buffering
 src/diff.rs      Myers diff + change detector (file content → CRDT ops)
+src/elemcodec.rs run-encoded element blocks, shared by the wire and state file
+src/slotindex.rs CharId -> arena slot as runs rather than one entry per char
 src/wire.rs      framing, MessagePack messages, run compression
 src/net.rs       TCP and TLS transport, certificate fingerprints
 src/auth.rs      pre-shared-key proofs with TLS channel binding
