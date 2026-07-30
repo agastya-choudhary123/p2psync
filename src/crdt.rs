@@ -110,15 +110,19 @@ struct Block {
     /// Origin of the *first* character. Every later character's origin is the
     /// character before it, which is computed, not stored.
     origin: Option<CharId>,
-    /// Offset of this block's text in `Doc::chars`.
-    at: u32,
-    len: u32,
+    /// The text this block holds: one String per block means 1 byte per ASCII
+    /// character instead of 4 bytes in a Vec<char>.
+    text: String,
     deleted: bool,
     next: u32,
     prev: u32,
 }
 
 impl Block {
+    #[inline]
+    fn len(&self) -> u32 {
+        self.text.chars().count() as u32
+    }
     #[inline]
     fn id_at(&self, off: u32) -> CharId {
         CharId {
@@ -128,7 +132,7 @@ impl Block {
     }
     #[inline]
     fn end_clock(&self) -> u64 {
-        self.clock + self.len as u64
+        self.clock + self.len() as u64
     }
     /// Origin of character `off`: the block's own origin for the first, the
     /// preceding character for the rest.
@@ -142,7 +146,11 @@ impl Block {
     }
     #[inline]
     fn last_id(&self) -> CharId {
-        self.id_at(self.len - 1)
+        self.id_at(self.len() - 1)
+    }
+    /// Get the character at offset (0-indexed).
+    fn char_at(&self, off: u32) -> Option<char> {
+        self.text.chars().nth(off as usize)
     }
 }
 
@@ -275,10 +283,8 @@ struct DocRepr {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(from = "DocRepr")]
 pub struct Doc {
-    /// Every character ever inserted, in insertion order. Blocks reference
-    /// contiguous slices of this; tombstoned text stays until a checkpoint
-    /// rebuilds the document.
-    chars: Vec<char>,
+    /// Blocks own their text directly as Strings (1 byte per ASCII char
+    /// instead of 4 in a Vec<char>).
     blocks: Vec<Block>,
     head: u32,
     tail: u32,
@@ -323,7 +329,6 @@ impl Serialize for Doc {
 impl Doc {
     pub fn new(peer: PeerId) -> Self {
         Self {
-            chars: Vec::new(),
             blocks: Vec::new(),
             head: NONE,
             tail: NONE,
@@ -382,7 +387,8 @@ impl Doc {
                 return None;
             }
             let b = &self.blocks[cur as usize];
-            if off >= b.len {
+            let block_len = b.len();
+            if off >= block_len {
                 cur = b.next;
                 off = 0;
                 continue;
@@ -390,7 +396,7 @@ impl Doc {
             let e = Elem {
                 id: b.id_at(off),
                 origin: b.origin_at(off),
-                ch: self.chars[(b.at + off) as usize],
+                ch: b.char_at(off).expect("valid offset"),
                 deleted: b.deleted,
             };
             off += 1;
@@ -403,7 +409,7 @@ impl Doc {
         let mut s = String::with_capacity(self.len_visible());
         for b in self.iter_blocks() {
             if !b.deleted {
-                s.extend(self.chars[b.at as usize..(b.at + b.len) as usize].iter());
+                s.push_str(&b.text);
             }
         }
         s
@@ -416,8 +422,9 @@ impl Doc {
         let mut n = 0u32;
         for b in self.iter_blocks() {
             if !b.deleted {
-                runs.push((b.id_at(0), b.len, n));
-                n += b.len;
+                let blen = b.len();
+                runs.push((b.id_at(0), blen, n));
+                n += blen;
             }
         }
         VisibleIds {
@@ -427,7 +434,7 @@ impl Doc {
     }
 
     pub fn len_visible(&self) -> usize {
-        self.iter_blocks().filter(|b| !b.deleted).map(|b| b.len as usize).sum()
+        self.iter_blocks().filter(|b| !b.deleted).map(|b| b.len() as usize).sum()
     }
 
     /// Elements in document order, tombstones included.
@@ -437,12 +444,12 @@ impl Doc {
 
     /// Number of stored characters, tombstones included.
     pub fn len_raw(&self) -> usize {
-        self.iter_blocks().map(|b| b.len as usize).sum()
+        self.iter_blocks().map(|b| b.len() as usize).sum()
     }
 
     /// How many stored characters are tombstones. Drives compaction decisions.
     pub fn tombstones(&self) -> usize {
-        self.iter_blocks().filter(|b| b.deleted).map(|b| b.len as usize).sum()
+        self.iter_blocks().filter(|b| b.deleted).map(|b| b.len() as usize).sum()
     }
 
     /// How many blocks the document occupies. The point of the representation,
@@ -551,7 +558,6 @@ impl Doc {
     /// This is also the path that recoalesces a document: elements arrive in
     /// order, so a file that is one run again becomes one block again.
     pub fn adopt(&mut self, elems: Vec<Elem>) {
-        self.chars = Vec::with_capacity(elems.len());
         self.blocks = Vec::new();
         self.index.clear();
         self.head = NONE;
@@ -574,14 +580,12 @@ impl Doc {
                         && b.end_clock() == e.id.clock
                         && b.deleted == e.deleted
                         && e.origin == Some(b.last_id())
-                        && (b.at + b.len) as usize == self.chars.len()
                 }
                 None => false,
             };
-            self.chars.push(e.ch);
             if extends {
                 let last = self.blocks.last_mut().expect("checked above");
-                last.len += 1;
+                last.text.push(e.ch);
                 let (peer, clock) = (last.peer, last.clock);
                 self.index.grow(peer, clock);
             } else {
@@ -591,8 +595,7 @@ impl Doc {
                     clock: e.id.clock,
                     peer: e.id.peer,
                     origin: e.origin,
-                    at: (self.chars.len() - 1) as u32,
-                    len: 1,
+                    text: e.ch.to_string(),
                     deleted: e.deleted,
                     next: NONE,
                     prev,
@@ -606,22 +609,27 @@ impl Doc {
                 self.index.add(e.id.peer, e.id.clock, 1, idx);
             }
         }
-        self.chars.shrink_to_fit();
         self.blocks.shrink_to_fit();
         self.index.shrink_to_fit();
     }
 
     // ---- block surgery ------------------------------------------------
 
-    /// Split block `b` at offset `at`, returning the index of the tail block
-    /// holding `[at, len)`. No text moves; the halves point into the same
-    /// buffer.
+    /// Split block `b` at character offset `at`, returning the index of the tail
+    /// block holding `[at, len)`. Splits the block's String by character offset.
     fn split_block(&mut self, b: u32, at: u32) -> u32 {
-        let (clock, peer, block_at, len, deleted, next) = {
-            let x = &self.blocks[b as usize];
-            (x.clock, x.peer, x.at, x.len, x.deleted, x.next)
+        let block_len = self.blocks[b as usize].len();
+        debug_assert!(at > 0 && at < block_len, "split at {at} of {block_len}");
+
+        let (clock, peer, deleted, next, text) = {
+            let block = &self.blocks[b as usize];
+            (block.clock, block.peer, block.deleted, block.next, block.text.clone())
         };
-        debug_assert!(at > 0 && at < len, "split at {at} of {len}");
+
+        // Find the byte offset of character `at` and split the text
+        let byte_pos: usize = text.chars().take(at as usize).map(|c| c.len_utf8()).sum();
+        let (left_text, right_text) = text.split_at(byte_pos);
+
         let tail = Block {
             clock: clock + at as u64,
             peer,
@@ -629,15 +637,14 @@ impl Doc {
                 clock: clock + at as u64 - 1,
                 peer,
             }),
-            at: block_at + at,
-            len: len - at,
+            text: right_text.to_string(),
             deleted,
             next,
             prev: b,
         };
         let ti = self.blocks.len() as u32;
         self.blocks.push(tail);
-        self.blocks[b as usize].len = at;
+        self.blocks[b as usize].text = left_text.to_string();
         self.blocks[b as usize].next = ti;
         if next == NONE {
             self.tail = ti;
@@ -651,7 +658,7 @@ impl Doc {
     /// Split as needed so that character `off` of block `b` is a block of its
     /// own, and return that block.
     fn isolate(&mut self, b: u32, off: u32) -> u32 {
-        let len = self.blocks[b as usize].len;
+        let len = self.blocks[b as usize].len();
         if off + 1 < len {
             self.split_block(b, off + 1);
         }
@@ -700,7 +707,7 @@ impl Doc {
         let mut next = match prev {
             Some((b, off)) => {
                 let blk = &self.blocks[b as usize];
-                if off + 1 < blk.len {
+                if off + 1 < blk.len() {
                     Some((b, off + 1))
                 } else if blk.next == NONE {
                     None
@@ -720,7 +727,7 @@ impl Doc {
             if blk.id_at(off) < id {
                 break;
             }
-            prev = Some((b, blk.len - 1));
+            prev = Some((b, blk.len() - 1));
             next = (blk.next != NONE).then_some((blk.next, 0));
         }
 
@@ -730,22 +737,21 @@ impl Doc {
         if let Some((b, off)) = prev {
             // Make `off` the last character of its block, so the new character
             // lands between two whole blocks.
-            if off + 1 < self.blocks[b as usize].len {
+            let blk_len = self.blocks[b as usize].len();
+            if off + 1 < blk_len {
                 self.split_block(b, off + 1);
             }
             // The common case by far: typing forward. The character continues
-            // this block's run and its text is the next thing in the buffer, so
-            // the block simply grows — no new block, no new index entry.
+            // this block's run, so the block simply grows — no new block, no new
+            // index entry.
             let blk = &self.blocks[b as usize];
             if blk.peer == id.peer
                 && blk.end_clock() == id.clock
                 && blk.deleted == deleted
                 && origin == Some(blk.last_id())
-                && (blk.at + blk.len) as usize == self.chars.len()
             {
                 let (peer, clock) = (blk.peer, blk.clock);
-                self.chars.push(ch);
-                self.blocks[b as usize].len += 1;
+                self.blocks[b as usize].text.push(ch);
                 self.index.grow(peer, clock);
                 return;
             }
@@ -759,15 +765,12 @@ impl Doc {
 
     /// Append a one-character block to the arena (unlinked).
     fn push_block(&mut self, id: CharId, origin: Option<CharId>, ch: char, deleted: bool) -> u32 {
-        let at = self.chars.len() as u32;
-        self.chars.push(ch);
         let idx = self.blocks.len() as u32;
         self.blocks.push(Block {
             clock: id.clock,
             peer: id.peer,
             origin,
-            at,
-            len: 1,
+            text: ch.to_string(),
             deleted,
             next: NONE,
             prev: NONE,
@@ -802,7 +805,6 @@ impl Doc {
     pub fn from_text(peer: PeerId, text: &str) -> (Self, Vec<Op>) {
         let char_count = text.chars().count();
         let mut doc = Doc::new(peer);
-        doc.chars.reserve(char_count);
         let mut ops = Vec::with_capacity(char_count);
         let mut prev = None;
         for ch in text.chars() {
@@ -823,7 +825,6 @@ impl Doc {
     pub fn from_shared_content(path: &str, text: &str) -> (Self, PeerId) {
         let lineage = content_lineage(path, text);
         let mut doc = Doc::new(lineage);
-        doc.chars.reserve(text.chars().count());
         let mut prev = None;
         for ch in text.chars() {
             let op = doc.local_insert(prev, ch);
@@ -857,21 +858,19 @@ mod tests {
         let mut prev_expected = NONE;
         while cur != NONE {
             let b = &doc.blocks[cur as usize];
-            assert!(b.len > 0, "empty block");
+            let blen = b.len();
+            assert!(blen > 0, "empty block");
             assert_eq!(b.prev, prev_expected, "broken prev link");
-            assert!(
-                (b.at + b.len) as usize <= doc.chars.len(),
-                "block text out of range"
-            );
+
             // Every character in the block must resolve back to it.
-            for off in 0..b.len {
+            for off in 0..blen {
                 assert_eq!(
                     doc.index.locate(&b.id_at(off)),
                     Some((cur, off)),
                     "index disagrees for offset {off}"
                 );
             }
-            seen += b.len as usize;
+            seen += b.len() as usize;
             prev_expected = cur;
             cur = b.next;
         }

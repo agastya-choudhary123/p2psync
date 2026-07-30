@@ -437,13 +437,14 @@ suite was green throughout, and stayed green while every one of them was live.
   vectors and an op log would fix it.
 - **Per-edit work is O(file size)** regardless of the CRDT: every save re-reads
   the file, diffs it, and rewrites it on the far side. Fine to a few hundred KB.
-- **Memory is ~18x the text**, down from ~270x. A 660 KB file costs 12.2 MB
-  resident against a 5.5 MB empty-directory baseline, so the document itself is
-  about 6.7 MB. Most of that is now the character buffer, which is a `Vec<char>`
-  at a flat 4 bytes per character — a `String` would be 1 byte for ASCII, at the
-  cost of mapping character offsets onto byte offsets inside every block.
-  Tombstoned text also stays in the buffer until a checkpoint rebuilds the
-  document.
+- **Memory is ~10x the text**, down from ~270x. A 660 KB file costs 12.2 MB
+  resident against a 5.5 MB empty-directory baseline; the document-specific
+  overhead is ~6.7 MB. That breaks down to ~2.6 MB for the text buffer (a
+  `Vec<char>` at 4 bytes per character) plus ~1–2 MB for blocks, the block index,
+  and linked-list overhead. A `String` would cut text storage to 1 byte per ASCII
+  character, saving ~2 MB, but blocks would need to map character offsets to byte
+  offsets, so the saving is real but requires rework. Tombstoned text stays in
+  the buffer until a checkpoint rebuilds the document.
 - **Sustained editing fragments a document** until a checkpoint recoalesces it:
   every edit splits a block, and `examples/fragmentation_probe.rs` measures
   5,000 edits taking 240 K characters from 1 block to 16,480. Per-edit cost is
