@@ -36,12 +36,15 @@ cargo build --release
 # now edit a file in ~/sync-a and watch it appear in ~/sync-b
 ```
 
-On a LAN, let the peers find each other, encrypt the link, and require a
-shared secret so only your machines can join:
+Links are encrypted by default. On a LAN, let peers find each other and
+require a shared secret so only your machines can join:
 
 ```bash
-./target/release/p2psync ~/sync -l 0.0.0.0:7901 --discover --tls --secret "$MY_KEY"
+./target/release/p2psync ~/sync -l 0.0.0.0:7901 --discover --secret "$MY_KEY"
 ```
+
+Pass `--insecure` to talk plaintext instead — only on a link you already trust
+some other way (a VPN tunnel, an SSH port-forward) or while debugging.
 
 Exclude paths with a `.p2psyncignore` in the sync root (gitignore-style globs,
 `*`/`?`/`**`, trailing `/` for directories):
@@ -173,16 +176,61 @@ and `three_peer_mesh_converges` tests both fail without it.
 
 Non-text files (invalid UTF-8 or containing NULs) don't get character-level
 merging. They're identified by SHA-256 and transferred with a receiver-driven
-rsync exchange: the receiver sends 4 KB block signatures (rsync's rolling
-checksum plus a truncated SHA-256), the sender computes copy/literal
-instructions against them, and the receiver reconstructs and verifies the hash
-before writing. The rolling checksum slides one byte at a time, so an insertion
-near the front of a file resyncs instead of resending everything.
+rsync exchange: the receiver sends block signatures (rsync's rolling checksum
+plus a truncated SHA-256), the sender computes copy/literal instructions
+against them, and the receiver reconstructs and verifies the hash before
+writing. The rolling checksum slides one byte at a time, so an insertion near
+the front of a file resyncs instead of resending everything.
 
 Conflicts are last-writer-wins, but on a **logical (Lamport) version** rather
 than a wall clock: two machines whose clocks disagree would otherwise hand the
 win to whichever one is set further ahead. Each local write bumps the version
 past anything seen for that path, and the peer id breaks ties.
+
+**Large files (video, images, archives) get four things a small file doesn't
+need:**
+
+- **The block size grows with the file** (`adaptive_block_size`), from 4 KB up
+  to 4 MB, so the signature list stays a few hundred KB instead of scaling
+  linearly with file size — a naive fixed 4 KB block would need 3 MB of
+  signatures for a 1 GB file.
+- **The delta streams as chunks, not one message.** A first sync of any file is
+  entirely literal bytes (there's nothing on the far side to diff against yet),
+  and one `BinaryDelta` message used to have to fit under `MAX_FRAME` (64 MB) —
+  a hard, silent failure for anything bigger. `BinaryDeltaChunk` messages,
+  numbered and bounded to ~4 MB each, remove the ceiling.
+- **The receiver never buffers the reconstructed file.** Each chunk applies
+  straight to a temp file as it arrives — matched blocks are read by seeking
+  into the receiver's own existing file, not loaded into memory — so
+  reconstructing an N-byte file costs O(chunk size), not O(N), on the
+  receiving side. The temp file is renamed into place only after the whole
+  hash verifies. Getting this bound to actually hold took a second fix: the
+  socket-reading loop originally read frames as fast as the network delivered
+  them regardless of whether anything downstream had caught up, so on
+  loopback a 120 MB transfer arrived in one burst and briefly cost 112 MB
+  resident anyway — the chunking was real, but nothing was pacing it. The read
+  loop now waits for an acknowledgment that a chunk has been handed to its
+  writer before reading the next frame, which throttles the TCP receive
+  window and, transitively, the sender. Measured: **28 MB peak resident for
+  both a 120 MB and a 300 MB transfer** — bounded by chunk size and pipeline
+  depth, not file size, confirmed by the fact that 2.5x the file didn't move
+  the number.
+- **Hashing and diffing happen off the single-threaded engine loop.**
+  Detecting that a large local file changed, and computing or applying a
+  delta for one, all run via `spawn_blocking` and report back through the
+  event channel — otherwise a multi-GB video would stall every other peer and
+  file until it finished. The one place this isn't fully true: handing a
+  chunk to its writer task goes through a bounded channel that the engine
+  loop itself awaits, so a pathologically slow disk on the receiving end
+  could still delay other peers by the time it takes that one send to clear —
+  a real edge of the single-loop design, not eliminated here.
+
+One place still scales with file size: generating a delta needs the *sender's*
+file resident to slide the rolling-checksum window, so that side still costs
+O(file size) memory (measured: ~280 MB resident for a 120 MB file, on the
+sending side only). Signature generation (the receiver fingerprinting its own
+file) and reconstruction (the receiver writing the result) don't — see
+`binary.rs`'s module docs for the reasoning.
 
 ### Authentication (`src/auth.rs`)
 
@@ -348,7 +396,7 @@ disk.
 ## Tests
 
 ```bash
-cargo test              # 67 tests
+cargo test              # 82 tests
 ```
 
 - `src/crdt.rs` unit tests — block invariants checked against the document's own
@@ -357,13 +405,20 @@ cargo test              # 67 tests
   delivery.
 - `tests/crdt.rs` — convergence and commutativity fuzzing, causal buffering,
   change-detector round-trips, wire compression round-trips.
+- `src/binary.rs` unit tests — adaptive block sizing, streamed vs. in-memory
+  signatures/apply equivalence under fuzzing (including the quadratic-tail
+  regression at large block sizes), compression round-trips, bounded-prefix
+  sniffing.
+- `src/wire.rs` unit tests — delta chunking respects `MAX_FRAME` even for a
+  delta far larger than one frame, compressible vs. incompressible literals.
 - `tests/binary.rs` — rolling checksum against recomputation, block reuse,
   delta reconstruction fuzzing.
 - `tests/sync_e2e.rs` — two and three real engines on real sockets: both
   directions, incremental edits, echo suppression, simultaneous edits
-  converging on disk, binary delta, deletes, nested directories, TLS,
-  reconnect-after-offline, and a three-peer *chain* — peer 3 dials only peer 2,
-  so a new file has to be relayed to reach it.
+  converging on disk, binary delta, an 18 MB file crossing multiple wire
+  chunks (with a follow-up delta against it), deletes, nested directories,
+  TLS, reconnect-after-offline, and a three-peer *chain* — peer 3 dials only
+  peer 2, so a new file has to be relayed to reach it.
 - `tests/hardening.rs` — authentication (right secret, wrong secret, missing
   secret, and a real TLS-terminating MITM relay), independently-created files
   merging without a conflict copy, ignore rules, manifest catch-up, and
@@ -377,7 +432,8 @@ cargo test              # 67 tests
 
 Each of these was a real limitation; each has a test that fails without the fix.
 
-- **Quadratic CRDT loading** → arena + linked list. 17.9s → 27.8ms for 220 KB.
+- **Quadratic CRDT loading** → arena + linked list, then block-per-run storage.
+  17.9s → 17.3ms for 220 KB.
 - **TLS without authentication** → `--secret` with HMAC proofs bound to the TLS
   certificate. Verified against an actual interception proxy.
 - **Anyone could join** → same mechanism; mismatched configs fail loudly instead
@@ -455,17 +511,16 @@ suite was green throughout, and stayed green while every one of them was live.
   It is 2.0x the document now rather than 77x, so that is 1.3 MB rather than
   50 MB per write, but it is still the entire document each time. An op log with
   periodic compaction would make it incremental.
-- **`--secret` over plaintext is authorization only.** With no certificate there
-  is nothing to bind to, so an active MITM is still possible; the process says so
-  on startup. Use `--tls`.
-- **Encryption is opt-in, and the default is not it.** Without `--tls` the
-  contents cross the wire in the clear. Verified rather than assumed, with a
-  relay between two peers: in the default mode the synced text is recoverable
-  straight off the socket, and with `--tls` the stream is TLS records and
-  nothing is recoverable. Note that a naive `grep` of the traffic finds nothing
-  either way — the CRDT ships one element per character, so the text is never
-  contiguous on the wire. That is not encryption, and it should not be mistaken
-  for it.
+- **`--secret` with `--insecure` is authorization only.** With no certificate
+  there is nothing to bind to, so an active MITM is still possible; the process
+  says so on startup. Drop `--insecure` to encrypt the link (the default).
+- **Encryption is on by default; `--insecure` turns it off.** Verified rather
+  than assumed, with a relay between two peers: in `--insecure` mode the synced
+  text is recoverable straight off the socket, and by default the stream is TLS
+  records and nothing is recoverable. Note that a naive `grep` of the traffic
+  finds nothing either way — the CRDT ships one element per character, so the
+  text is never contiguous on the wire. That is not encryption, and it should
+  not be mistaken for it.
 - **No NAT traversal.** mDNS covers a LAN; anything else needs manual
   `--peer host:port` and reachable ports.
 - **Untested territory:** two physically separate machines, Linux/inotify (the
@@ -484,7 +539,7 @@ src/net.rs       TCP and TLS transport, certificate fingerprints
 src/auth.rs      pre-shared-key proofs with TLS channel binding
 src/ignore.rs    .p2psyncignore parsing and glob matching
 src/watcher.rs   FSEvents watching, debouncing
-src/binary.rs    SHA-256, rolling checksum, rsync-style delta
+src/binary.rs    SHA-256, adaptive-block rolling checksum, streamed rsync delta
 src/engine.rs    the state machine tying it together
 src/discovery.rs mDNS advertise + browse
 src/bin/bench.rs benchmark harness

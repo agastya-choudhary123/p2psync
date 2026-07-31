@@ -7,7 +7,17 @@ use clap::Parser;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
-#[command(name = "p2psync", about = "Peer-to-peer file sync with streaming CRDT merge")]
+#[command(
+    name = "p2psync",
+    about = "Peer-to-peer file sync with streaming CRDT merge",
+    long_about = "Peer-to-peer file sync with streaming CRDT merge.\n\n\
+        Text files merge character-by-character; anything else (video, images, \
+        archives, ...) syncs as a whole with an rsync-style delta on later changes.\n\n\
+        Minimal LAN use:      p2psync ~/sync --discover --secret KEY\n\
+        Minimal direct link:  p2psync ~/sync --peer host:port --secret KEY\n\n\
+        Encrypted by default. Pass --insecure only on a link you already trust \
+        (e.g. inside a VPN tunnel) or while debugging."
+)]
 struct Args {
     /// Directory to keep in sync.
     dir: PathBuf,
@@ -24,16 +34,19 @@ struct Args {
     #[arg(short, long)]
     name: Option<String>,
 
-    /// Encrypt peer links with TLS. All peers must agree.
+    /// Skip TLS and talk plaintext. Encrypted is the default; only pass this
+    /// on a link you already trust some other way (a VPN tunnel, an SSH
+    /// port-forward) or while debugging on localhost.
     #[arg(long)]
-    tls: bool,
+    insecure: bool,
 
     /// Find peers on the local network via mDNS.
     #[arg(long)]
     discover: bool,
 
     /// Shared secret every peer must prove. Also read from P2PSYNC_SECRET.
-    /// Combine with --tls to also rule out an active man-in-the-middle.
+    /// Without TLS too (--insecure) this only rules out an accidental sync
+    /// with the wrong peer, not an active attacker.
     #[arg(long)]
     secret: Option<String>,
 
@@ -81,6 +94,9 @@ async fn main() -> Result<()> {
              Pass --secret to require authentication."
         );
     }
+    if args.insecure {
+        eprintln!("[net] --insecure: links are plaintext. Only use this on a link you already trust.");
+    }
 
     let cfg = engine::Config {
         root: args.dir,
@@ -88,7 +104,7 @@ async fn main() -> Result<()> {
         name,
         listen: args.listen,
         peers: args.peers,
-        tls: args.tls,
+        tls: !args.insecure,
         discovery: args.discover,
         verbose: args.verbose,
         secret,
