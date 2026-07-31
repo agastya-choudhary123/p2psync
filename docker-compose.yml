@@ -1,0 +1,68 @@
+version: '3.8'
+
+services:
+  alice:
+    build: .
+    container_name: p2psync-alice
+    hostname: alice
+    ports:
+      - "7901:7901"
+    volumes:
+      - alice-sync:/sync
+    command: [
+      "p2psync", ".",
+      "-l", "0.0.0.0:7901",
+      "--name", "alice",
+      "--insecure"
+    ]
+    networks:
+      - p2p-net
+
+  bob:
+    build: .
+    container_name: p2psync-bob
+    hostname: bob
+    ports:
+      - "7902:7901"
+    volumes:
+      - bob-sync:/sync
+    command: [
+      "p2psync", ".",
+      "-l", "0.0.0.0:7901",
+      "--peer", "alice:7901",
+      "--name", "bob",
+      "--insecure"
+    ]
+    depends_on:
+      - alice
+    networks:
+      - p2p-net
+
+  charlie:
+    build: .
+    container_name: p2psync-charlie
+    hostname: charlie
+    ports:
+      - "7903:7901"
+    volumes:
+      - charlie-sync:/sync
+    command: [
+      "p2psync", ".",
+      "-l", "0.0.0.0:7901",
+      "--peer", "bob:7901",
+      "--name", "charlie",
+      "--insecure"
+    ]
+    depends_on:
+      - bob
+    networks:
+      - p2p-net
+
+volumes:
+  alice-sync:
+  bob-sync:
+  charlie-sync:
+
+networks:
+  p2p-net:
+    driver: bridge
