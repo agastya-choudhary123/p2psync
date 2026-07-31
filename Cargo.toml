@@ -20,6 +20,7 @@ hex = "0.4"
 serde_bytes = "0.11"
 tempfile = "3"
 hmac = "0.12"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

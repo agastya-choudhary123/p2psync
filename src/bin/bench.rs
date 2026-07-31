@@ -168,17 +168,28 @@ fn bench_bandwidth() {
     let t0 = Instant::now();
     let ops = binary::delta(&blob, &sigs);
     let elapsed = t0.elapsed();
-    let frame = wire::encode(&Msg::BinaryDelta {
-        path: "image.bin".into(),
-        hash: binary::sha256_hex(&blob),
-        version: 1,
-        ops,
-    })
-    .unwrap();
+    let chunks = wire::chunk_ops(ops);
+    let total = chunks.len() as u32;
+    let frame_bytes: usize = chunks
+        .into_iter()
+        .enumerate()
+        .map(|(seq, ops)| {
+            wire::encode(&Msg::BinaryDeltaChunk {
+                path: "image.bin".into(),
+                hash: binary::sha256_hex(&blob),
+                version: 1,
+                seq: seq as u32,
+                total,
+                ops,
+            })
+            .unwrap()
+            .len()
+        })
+        .sum();
     println!(
         "  binary 1-byte flip in 4 MB   wire={:>6} bytes   ({:.4}% of the file; delta computed in {:.1}ms)",
-        frame.len(),
-        100.0 * frame.len() as f64 / blob.len() as f64,
+        frame_bytes,
+        100.0 * frame_bytes as f64 / blob.len() as f64,
         elapsed.as_secs_f64() * 1e3
     );
 }

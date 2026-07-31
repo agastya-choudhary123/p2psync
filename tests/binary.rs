@@ -8,7 +8,7 @@ use rand::{Rng, RngCore, SeedableRng};
 fn literal_bytes(ops: &[DeltaOp]) -> usize {
     ops.iter()
         .map(|o| match o {
-            DeltaOp::Literal(b) => b.len(),
+            DeltaOp::Literal(b) | DeltaOp::LiteralZ(b) => b.len(),
             DeltaOp::CopyBlock(_) => 0,
         })
         .sum()

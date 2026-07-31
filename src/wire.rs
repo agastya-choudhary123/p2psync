@@ -98,11 +98,19 @@ pub enum Msg {
         sigs: Vec<(u32, [u8; 8])>,
     },
 
-    /// Reconstruction instructions against the requester's own blocks.
-    BinaryDelta {
+    /// One chunk of reconstruction instructions against the requester's own
+    /// blocks. A delta for a large or wholly-new file can run past
+    /// `MAX_FRAME` in one message — a first sync of any file is entirely
+    /// `Literal` bytes, so this was a hard failure for any file bigger than
+    /// the frame cap. Splitting into `seq`/`total`-numbered chunks removes the
+    /// size limit; see `engine`'s streaming receive path, which writes each
+    /// chunk straight to a temp file rather than collecting them first.
+    BinaryDeltaChunk {
         path: String,
         hash: String,
         version: u64,
+        seq: u32,
+        total: u32,
         ops: Vec<DeltaOp>,
     },
 }
@@ -135,6 +143,72 @@ pub enum DeltaOp {
     /// Literal bytes the receiver did not have. `serde_bytes` keeps this in
     /// MessagePack's compact bin format instead of an array of ints.
     Literal(#[serde(with = "serde_bytes")] Vec<u8>),
+    /// Literal bytes, DEFLATE-compressed — used when compression actually
+    /// shrank the payload (see `binary::maybe_compress`); an already-compressed
+    /// format like jpg or mp4 just uses `Literal` since compressing it again
+    /// buys nothing.
+    LiteralZ(#[serde(with = "serde_bytes")] Vec<u8>),
+}
+
+/// Bound on one chunk's serialized size, well under `MAX_FRAME` so a chunk
+/// leaves headroom for MessagePack framing overhead and never needs to be
+/// split further.
+pub const DELTA_CHUNK_TARGET: usize = 4 << 20; // 4 MB
+
+/// Group `ops` into chunks no larger than `DELTA_CHUNK_TARGET`, compressing
+/// each literal payload that's worth compressing along the way.
+///
+/// A single `CopyBlock` is 5 bytes and never needs splitting. A `Literal` can
+/// be arbitrarily large — a first sync of any file (nothing on the far side to
+/// diff against yet) is exactly one `Literal` the size of the *whole file*,
+/// not one per block, since `delta_with_block_size` only starts a new op when
+/// it finds a match to interrupt the literal run. An earlier version of this
+/// function only cut chunk boundaries *between* ops and left an oversized
+/// single literal whole, on the reasoning that it was rare and bounded; it
+/// was neither — it's the common case for any new file, and it reproduced the
+/// exact `MAX_FRAME` failure this whole mechanism exists to remove, just
+/// pushed one level down. So a literal is now split into
+/// `DELTA_CHUNK_TARGET`-sized pieces *before* anything else, each piece
+/// compressed independently, and chunking only ever groups pieces that are
+/// already at most one chunk's worth.
+pub fn chunk_ops(ops: Vec<DeltaOp>) -> Vec<Vec<DeltaOp>> {
+    if ops.is_empty() {
+        return vec![Vec::new()];
+    }
+    let mut pieces: Vec<DeltaOp> = Vec::new();
+    for op in ops {
+        match op {
+            DeltaOp::Literal(bytes) => {
+                for piece in bytes.chunks(DELTA_CHUNK_TARGET) {
+                    pieces.push(match crate::binary::maybe_compress(piece) {
+                        Some(z) => DeltaOp::LiteralZ(z),
+                        None => DeltaOp::Literal(piece.to_vec()),
+                    });
+                }
+            }
+            other => pieces.push(other),
+        }
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = Vec::new();
+    let mut current_size = 0usize;
+    for op in pieces {
+        let size = match &op {
+            DeltaOp::Literal(b) | DeltaOp::LiteralZ(b) => b.len(),
+            DeltaOp::CopyBlock(_) => 5,
+        };
+        if current_size + size > DELTA_CHUNK_TARGET && !current.is_empty() {
+            chunks.push(std::mem::take(&mut current));
+            current_size = 0;
+        }
+        current_size += size;
+        current.push(op);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
 }
 
 /// Wire-level encoding of CRDT operations.
@@ -268,4 +342,161 @@ pub async fn read_msg<R: AsyncRead + Unpin>(r: &mut R) -> Result<Msg> {
     let mut body = vec![0u8; len];
     r.read_exact(&mut body).await?;
     Ok(rmp_serde::from_slice(&body)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn total_literal_bytes(chunks: &[Vec<DeltaOp>]) -> usize {
+        chunks
+            .iter()
+            .flatten()
+            .map(|op| match op {
+                DeltaOp::Literal(b) | DeltaOp::LiteralZ(b) => b.len(),
+                DeltaOp::CopyBlock(_) => 0,
+            })
+            .sum()
+    }
+
+    #[test]
+    fn empty_ops_still_produce_one_chunk() {
+        // A delta that reused every block (no changes) is still a valid
+        // "here is your file" message: the receiver must see at least one
+        // chunk to know the transfer is complete.
+        let chunks = chunk_ops(vec![]);
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].is_empty());
+    }
+
+    #[test]
+    fn small_ops_fit_in_one_chunk() {
+        let ops = vec![DeltaOp::CopyBlock(0), DeltaOp::Literal(vec![1, 2, 3])];
+        let chunks = chunk_ops(ops);
+        assert_eq!(chunks.len(), 1);
+    }
+
+    #[test]
+    fn large_literal_run_splits_into_multiple_chunks() {
+        use rand::{RngCore, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(9);
+        let mut ops = Vec::new();
+        for _ in 0..20u32 {
+            // Genuinely random bytes: incompressible, so the pre-chunk size is
+            // exactly what drives the split, exercising the chunk-size
+            // accounting rather than DEFLATE's.
+            let mut bytes = vec![0u8; DELTA_CHUNK_TARGET / 3];
+            rng.fill_bytes(&mut bytes);
+            ops.push(DeltaOp::Literal(bytes));
+        }
+        let total_in: usize = ops
+            .iter()
+            .map(|o| match o {
+                DeltaOp::Literal(b) => b.len(),
+                _ => 0,
+            })
+            .sum();
+        let chunks = chunk_ops(ops);
+        assert!(chunks.len() > 1, "should have split into multiple chunks");
+        assert_eq!(total_literal_bytes(&chunks), total_in, "no bytes lost, none duplicated");
+    }
+
+    #[test]
+    fn compressible_literal_becomes_literal_z() {
+        let text = "the quick brown fox ".repeat(500).into_bytes();
+        let chunks = chunk_ops(vec![DeltaOp::Literal(text)]);
+        assert!(matches!(chunks[0][0], DeltaOp::LiteralZ(_)), "compressible text should compress");
+    }
+
+    #[test]
+    fn a_single_oversized_literal_splits_and_fits_frames() {
+        // The real shape a first sync of a large file produces: not many
+        // separate ops, but exactly ONE Literal covering the entire file,
+        // because there is nothing on the other side to interrupt it with a
+        // CopyBlock match. This is the case an earlier version of chunk_ops
+        // got wrong — grouping only cuts *between* ops, so one enormous
+        // literal sailed through whole and blew MAX_FRAME on send.
+        use rand::{RngCore, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(99);
+        let mut whole_file = vec![0u8; 20 << 20]; // 20 MB, one Literal
+        rng.fill_bytes(&mut whole_file);
+
+        let chunks = chunk_ops(vec![DeltaOp::Literal(whole_file.clone())]);
+        assert!(chunks.len() > 1, "a 20 MB single literal must split");
+
+        let mut reassembled = Vec::new();
+        for (i, ops) in chunks.iter().enumerate() {
+            let msg = Msg::BinaryDeltaChunk {
+                path: "movie.mp4".into(),
+                hash: "irrelevant".into(),
+                version: 1,
+                seq: i as u32,
+                total: chunks.len() as u32,
+                ops: ops.clone(),
+            };
+            let frame = encode(&msg).expect("every chunk must fit in one frame");
+            assert!(frame.len() < MAX_FRAME, "chunk {i} is {} bytes", frame.len());
+            for op in ops {
+                match op {
+                    DeltaOp::Literal(b) => reassembled.extend_from_slice(b),
+                    DeltaOp::LiteralZ(z) => reassembled.extend(crate::binary::decompress(z).unwrap()),
+                    DeltaOp::CopyBlock(_) => unreachable!(),
+                }
+            }
+        }
+        assert_eq!(reassembled, whole_file, "splitting and reassembling must be lossless");
+    }
+
+    #[test]
+    fn chunks_never_exceed_the_wire_frame_cap() {
+        // A single delta bigger than MAX_FRAME used to fail outright —
+        // `encode` bailed with "frame too large" and the sync silently gave
+        // up, which is exactly what a first sync of any file over 64 MB did
+        // (a first sync has nothing to diff against, so it's one giant
+        // `Literal`). Build a delta comfortably past that cap and check every
+        // resulting frame actually fits.
+        let mut x = 0x2545F4914F6CDD1Du64;
+        let mut rnd = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut ops = Vec::new();
+        let mut remaining = 70usize << 20; // 70 MB, past the 64 MB cap
+        while remaining > 0 {
+            let n = remaining.min(1 << 20);
+            let mut bytes = vec![0u8; n];
+            for chunk in bytes.chunks_mut(8) {
+                chunk.copy_from_slice(&rnd().to_le_bytes()[..chunk.len()]);
+            }
+            ops.push(DeltaOp::Literal(bytes));
+            remaining -= n;
+        }
+
+        let chunks = chunk_ops(ops);
+        assert!(chunks.len() > 1, "70 MB of incompressible data must not fit in one chunk");
+        for (i, ops) in chunks.into_iter().enumerate() {
+            let msg = Msg::BinaryDeltaChunk {
+                path: "big.bin".into(),
+                hash: "deadbeef".into(),
+                version: 1,
+                seq: i as u32,
+                total: 99,
+                ops,
+            };
+            let frame = encode(&msg).expect("every chunk must fit in one frame");
+            assert!(frame.len() < MAX_FRAME, "chunk {i} is {} bytes, still over MAX_FRAME", frame.len());
+        }
+    }
+
+    #[test]
+    fn incompressible_literal_stays_literal() {
+        use rand::{RngCore, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(10);
+        let mut random = vec![0u8; 4096];
+        rng.fill_bytes(&mut random);
+        let chunks = chunk_ops(vec![DeltaOp::Literal(random)]);
+        assert!(matches!(chunks[0][0], DeltaOp::Literal(_)), "incompressible data should stay raw");
+    }
 }

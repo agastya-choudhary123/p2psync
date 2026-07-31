@@ -14,7 +14,9 @@ use crate::watcher::{self, FsEvent};
 use crate::wire::{self, read_msg, write_msg, BinDigest, DeltaOp, Msg, TextDigest, BLOCK_SIZE};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -107,8 +109,36 @@ enum Event {
         from: PeerId,
         msg: Msg,
     },
+    /// A `BinaryDeltaChunk` specifically. `ack` is fired once the chunk has
+    /// been handed off to its writer task, which is `pump`'s signal that it's
+    /// safe to read the next frame off the socket — see the comment at the
+    /// call site in `pump`.
+    BinaryChunk {
+        from: PeerId,
+        msg: Msg,
+        ack: tokio::sync::oneshot::Sender<()>,
+    },
     Disconnected(PeerId),
     Tick,
+    /// A locally changed binary file's hash finished computing in the
+    /// background (see `on_local_binary_touched`). Hashing happens off the
+    /// engine loop so a multi-GB file being hashed doesn't stall every other
+    /// peer and file in the meantime.
+    LocalBinaryHashed { rel: String, hash: String, len: u64 },
+    /// A streamed binary reconstruction (see `BinaryRecv`) finished — either
+    /// the hash verified and the temp file is ready to become the real file,
+    /// or it didn't and the temp file should be discarded.
+    BinaryReceived {
+        from: PeerId,
+        path: String,
+        version: u64,
+        outcome: BinaryOutcome,
+    },
+}
+
+enum BinaryOutcome {
+    Verified { tmp: PathBuf, hash: String, len: u64 },
+    Failed(String),
 }
 
 pub struct Engine {
@@ -130,6 +160,19 @@ pub struct Engine {
     reported: (u64, u64),
     ignore: Ignore,
     last_compaction_check: Instant,
+    /// Block size a `BinarySignatures` reply was built with, remembered per
+    /// (peer, path) between sending it and the matching delta chunks arriving,
+    /// since only the sender of that message chose the value.
+    pending_block_size: HashMap<(PeerId, String), usize>,
+    /// Streamed reconstructions in progress, keyed by (peer, path). Each entry
+    /// is the sending half of a channel feeding a background task that applies
+    /// chunks to a temp file as they arrive — see `on_binary_delta_chunk`.
+    binary_recv: HashMap<(PeerId, String), mpsc::Sender<Vec<DeltaOp>>>,
+    /// Clonable handle back into the event loop, for background tasks
+    /// (spawned via `spawn_blocking` for anything that touches a whole large
+    /// file) to report their result without giving them direct access to
+    /// `Engine`'s state, which only the loop itself may mutate.
+    ev_tx: mpsc::UnboundedSender<Event>,
 }
 
 fn now_ms() -> u64 {
@@ -168,6 +211,9 @@ impl Engine {
             reported: (0, 0),
             ignore: Ignore::load(&cfg.root),
             last_compaction_check: Instant::now(),
+            pending_block_size: HashMap::new(),
+            binary_recv: HashMap::new(),
+            ev_tx: ev_tx.clone(),
             cfg,
         };
         engine.load_state();
@@ -342,15 +388,34 @@ impl Engine {
                 if let Some(p) = self.peers.remove(&peer_id) {
                     println!("[peer] - {} \"{}\"", format_id(peer_id), p.name);
                 }
+                // Drop any in-flight receives from this peer. Dropping the
+                // sender closes the channel the background writer is reading;
+                // it notices, deletes its partial temp file, and exits.
+                self.binary_recv.retain(|(from, _), _| *from != peer_id);
                 Ok(())
             }
             Event::Msg { from, msg } => self.on_msg(from, msg),
+            Event::BinaryChunk { from, msg, ack } => {
+                let Msg::BinaryDeltaChunk { path, hash, version, seq, total, ops } = msg else {
+                    unreachable!("pump only wraps BinaryDeltaChunk in Event::BinaryChunk")
+                };
+                let result = self.on_binary_delta_chunk(from, path, hash, version, seq, total, ops).await;
+                // Fire after handing off, not before: this is what makes the
+                // read loop's wait an actual backpressure signal rather than
+                // a formality.
+                let _ = ack.send(());
+                result
+            }
             Event::Tick => {
                 self.flush_pending_deletes();
                 self.prune_self_writes();
                 self.report_stats();
                 self.maybe_compact();
                 Ok(())
+            }
+            Event::LocalBinaryHashed { rel, hash, len } => self.on_local_binary(rel, hash, len),
+            Event::BinaryReceived { from, path, version, outcome } => {
+                self.on_binary_received(from, path, version, outcome)
             }
         }
     }
@@ -389,6 +454,30 @@ impl Engine {
 
     fn on_touched(&mut self, path: &Path) -> Result<()> {
         let Some(rel) = self.rel(path) else { return Ok(()) };
+
+        // Sniff from a bounded prefix rather than reading the whole file: a
+        // text document needs its full content to diff regardless, but a
+        // binary file (the common case for anything large — video, images,
+        // archives) does not, and reading gigabytes just to classify a file is
+        // wasted work before we've even decided whether to hash it.
+        let is_binary = match binary::sniff_file(path) {
+            Ok(b) => b,
+            Err(_) => return Ok(()), // vanished or unreadable since the event fired
+        };
+        if is_binary {
+            // Hashing is the remaining O(file size) step, so it moves off the
+            // single-threaded engine loop too — otherwise hashing a large
+            // video blocks every other peer and file until it finishes.
+            let full = path.to_path_buf();
+            let tx = self.ev_tx.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Ok((hash, len)) = binary::sha256_file(&full) {
+                    let _ = tx.send(Event::LocalBinaryHashed { rel, hash, len });
+                }
+            });
+            return Ok(());
+        }
+
         let Ok(bytes) = std::fs::read(path) else { return Ok(()) };
         let hash = binary::sha256_hex(&bytes);
 
@@ -400,9 +489,6 @@ impl Engine {
             }
         }
 
-        if binary::is_binary(&bytes) {
-            return self.on_local_binary(rel, bytes, hash);
-        }
         let text = String::from_utf8_lossy(&bytes).to_string();
 
         // A create whose content matches a just-deleted file is a rename.
@@ -479,7 +565,17 @@ impl Engine {
         Ok(())
     }
 
-    fn on_local_binary(&mut self, rel: String, bytes: Vec<u8>, hash: String) -> Result<()> {
+    fn on_local_binary(&mut self, rel: String, hash: String, len: u64) -> Result<()> {
+        // Echo suppression happens here rather than in `on_touched`, because
+        // for a binary file the hash only exists once the background hashing
+        // task reports back with `Event::LocalBinaryHashed`.
+        let full = self.cfg.root.join(&rel);
+        if let Some(list) = self.self_writes.get_mut(&full) {
+            if let Some(i) = list.iter().position(|(h, _)| *h == hash) {
+                list.remove(i);
+                return Ok(());
+            }
+        }
         if self.state.bin.get(&rel).map(|b| b.hash.as_str()) == Some(hash.as_str()) {
             return Ok(());
         }
@@ -488,7 +584,7 @@ impl Engine {
         let version = self.state.bin.get(&rel).map(|b| b.version).unwrap_or(0) + 1;
         let entry = BinEntry {
             hash: hash.clone(),
-            len: bytes.len() as u64,
+            len,
             version,
         };
         println!("[sync] binary {rel} ({} bytes, {})", entry.len, &hash[..8]);
@@ -550,6 +646,7 @@ impl Engine {
     fn on_msg(&mut self, from: PeerId, msg: Msg) -> Result<()> {
         match msg {
             Msg::Hello { .. } | Msg::Auth { .. } => Ok(()), // handled during handshake
+            Msg::BinaryDeltaChunk { .. } => Ok(()), // intercepted in handle() before reaching here
             Msg::Manifest { text, bin } => self.on_manifest(from, text, bin),
             Msg::SnapshotRequest { paths } => self.on_snapshot_request(from, paths),
             Msg::Checkpoint { path, elems, base, text_hash } => {
@@ -597,9 +694,6 @@ impl Engine {
             }
             Msg::BinarySignatures { path, block_size, sigs } => {
                 self.on_binary_signatures(from, path, block_size, sigs)
-            }
-            Msg::BinaryDelta { path, hash, version, ops } => {
-                self.on_binary_delta(from, path, hash, version, ops)
             }
         }
     }
@@ -817,7 +911,7 @@ impl Engine {
         Ok(())
     }
 
-    fn on_binary_meta(&mut self, from: PeerId, path: String, hash: String, _len: u64, version: u64) -> Result<()> {
+    fn on_binary_meta(&mut self, from: PeerId, path: String, hash: String, len: u64, version: u64) -> Result<()> {
         if let Some(local) = self.state.bin.get(&path) {
             if local.hash == hash {
                 // Same bytes: just keep the logical clock monotonic.
@@ -834,20 +928,35 @@ impl Engine {
                 return Ok(());
             }
         }
-        // Ask for a delta against whatever we currently have.
-        let current = std::fs::read(self.cfg.root.join(&path)).unwrap_or_default();
-        let sigs = binary::signatures(&current);
-        if self.cfg.verbose {
-            println!("[recv] {path}: requesting delta ({} local blocks)", sigs.len());
-        }
-        self.send_to(
-            from,
-            Msg::BinarySignatures {
+        let Some(peer_tx) = self.peers.get(&from).map(|p| p.tx.clone()) else { return Ok(()) };
+
+        // Block size is chosen from the sender's announced length, so the
+        // signature list stays bounded (a few hundred KB, not a few MB) no
+        // matter how large the file is. We're the only side that knows this
+        // value — it isn't carried back on the wire — so remember it against
+        // the matching delta chunks arriving later.
+        let block_size = binary::adaptive_block_size(len);
+        self.pending_block_size.insert((from, path.clone()), block_size);
+
+        let full = self.cfg.root.join(&path);
+        let verbose = self.cfg.verbose;
+        // Off the engine loop: building signatures over our own current copy
+        // is a full sequential pass of the file, which for a large video is
+        // real wall-clock time that nothing else should wait on.
+        tokio::task::spawn_blocking(move || {
+            let sigs = std::fs::File::open(&full)
+                .map(std::io::BufReader::new)
+                .and_then(|r| binary::signatures_from_reader(r, block_size))
+                .unwrap_or_default();
+            if verbose {
+                println!("[recv] {path}: requesting delta ({} local blocks of {block_size})", sigs.len());
+            }
+            let _ = peer_tx.send(Msg::BinarySignatures {
                 path,
-                block_size: BLOCK_SIZE as u32,
+                block_size: block_size as u32,
                 sigs,
-            },
-        );
+            });
+        });
         Ok(())
     }
 
@@ -858,82 +967,197 @@ impl Engine {
         block_size: u32,
         sigs: Vec<(u32, [u8; 8])>,
     ) -> Result<()> {
-        if block_size as usize != BLOCK_SIZE {
-            anyhow::bail!("peer asked for block size {block_size}, we only speak {BLOCK_SIZE}");
-        }
+        let Some(peer_tx) = self.peers.get(&from).map(|p| p.tx.clone()) else { return Ok(()) };
+        let block_size = block_size as usize;
         let full = self.cfg.root.join(&path);
-        let Ok(data) = std::fs::read(&full) else { return Ok(()) };
-        let ops = binary::delta(&data, &sigs);
-        let literal: usize = ops
-            .iter()
-            .map(|o| match o {
-                DeltaOp::Literal(b) => b.len(),
-                DeltaOp::CopyBlock(_) => 0,
-            })
-            .sum();
-        println!(
-            "[sync] {path}: delta to {} — {} literal bytes of {} ({} block reuses)",
-            format_id(from),
-            literal,
-            data.len(),
-            ops.iter().filter(|o| matches!(o, DeltaOp::CopyBlock(_))).count()
-        );
         let version = self.state.bin.get(&path).map(|b| b.version).unwrap_or(1);
-        self.send_to(
-            from,
-            Msg::BinaryDelta {
-                path,
-                hash: binary::sha256_hex(&data),
-                version,
-                ops,
-            },
-        );
+
+        // Off the engine loop: the rolling-checksum scan needs the file
+        // resident to slide its window, so this is the one place binary sync
+        // still costs O(file size) memory — on the sending side only, and
+        // never on the loop that every other peer and file depends on.
+        tokio::task::spawn_blocking(move || {
+            let Ok(data) = std::fs::read(&full) else { return };
+            let hash = binary::sha256_hex(&data);
+            let ops = binary::delta_with_block_size(&data, &sigs, block_size);
+            let literal: usize = ops
+                .iter()
+                .map(|o| match o {
+                    DeltaOp::Literal(b) => b.len(),
+                    _ => 0,
+                })
+                .sum();
+            println!(
+                "[sync] {path}: delta to {} — {} literal bytes of {} ({} block reuses)",
+                format_id(from),
+                literal,
+                data.len(),
+                ops.iter().filter(|o| matches!(o, DeltaOp::CopyBlock(_))).count()
+            );
+            // Compression and chunking both happen here: literal bytes are
+            // compressed where it helps, and the whole delta is split into
+            // wire-sized pieces, so a file with nothing in common with what
+            // the peer has — the first sync of any file — no longer has to
+            // fit in one frame under MAX_FRAME.
+            let chunks = wire::chunk_ops(ops);
+            let total = chunks.len() as u32;
+            for (seq, ops) in chunks.into_iter().enumerate() {
+                let msg = Msg::BinaryDeltaChunk {
+                    path: path.clone(),
+                    hash: hash.clone(),
+                    version,
+                    seq: seq as u32,
+                    total,
+                    ops,
+                };
+                if peer_tx.send(msg).is_err() {
+                    break; // peer disconnected mid-transfer
+                }
+            }
+        });
         Ok(())
     }
 
-    fn on_binary_delta(
+    /// One chunk of a streamed binary reconstruction.
+    ///
+    /// `seq == 0` starts a fresh background writer (see `start_binary_receive`)
+    /// that applies chunks to a temp file as they arrive, keyed by (peer,
+    /// path) in `binary_recv`; every chunk after that is handed to whichever
+    /// writer is currently registered for that key. Sending is awaited rather
+    /// than fire-and-forget so a writer that's momentarily behind (a slow
+    /// disk) applies backpressure instead of a chunk being silently dropped —
+    /// dropping one would corrupt the reconstruction.
+    #[allow(clippy::too_many_arguments)] // one per BinaryDeltaChunk wire field
+    async fn on_binary_delta_chunk(
         &mut self,
         from: PeerId,
         path: String,
         hash: String,
         version: u64,
+        seq: u32,
+        total: u32,
         ops: Vec<DeltaOp>,
     ) -> Result<()> {
-        let base = std::fs::read(self.cfg.root.join(&path)).unwrap_or_default();
-        let rebuilt = binary::apply_delta(&base, &ops);
-        let got = binary::sha256_hex(&rebuilt);
-        if got != hash {
-            anyhow::bail!("{path}: delta from {} reconstructed to {} but peer said {hash}", format_id(from), got);
+        let key = (from, path.clone());
+        if seq == 0 {
+            self.start_binary_receive(from, path.clone(), hash, version, total);
         }
-        self.write_file(&path, &rebuilt)?;
-        let version = version.max(self.state.bin.get(&path).map(|b| b.version).unwrap_or(0));
+        if let Some(tx) = self.binary_recv.get(&key).cloned() {
+            let _ = tx.send(ops).await;
+        }
+        Ok(())
+    }
 
-        // Check if the hash changed from what we had before.
-        let hash_changed = self.state.bin.get(&path).map(|b| &b.hash) != Some(&hash);
+    /// Spawn the background task that streams one binary reconstruction to a
+    /// temp file: it reads matched blocks from the receiver's own current
+    /// file by seeking (never loading it whole), applies each chunk of ops as
+    /// it arrives through the channel registered in `binary_recv`, and hashes
+    /// as it writes. Bounds receiver memory to O(chunk size) rather than
+    /// O(file size) — the thing that made a multi-GB file previously cost a
+    /// multi-GB `Vec<u8>` on this side.
+    fn start_binary_receive(&mut self, from: PeerId, path: String, hash: String, version: u64, total: u32) {
+        let block_size = self
+            .pending_block_size
+            .remove(&(from, path.clone()))
+            .unwrap_or(BLOCK_SIZE);
+        let (tx, mut rx) = mpsc::channel::<Vec<DeltaOp>>(4);
+        self.binary_recv.insert((from, path.clone()), tx);
 
-        self.state.bin.insert(
-            path.clone(),
-            BinEntry {
-                hash: hash.clone(),
-                len: rebuilt.len() as u64,
+        let full = self.cfg.root.join(&path);
+        let tmp = full.with_extension(format!("p2ptmp{}", std::process::id()));
+        let ev_tx = self.ev_tx.clone();
+        let path_for_task = path.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let result = (|| -> std::io::Result<BinaryOutcome> {
+                if let Some(parent) = full.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let mut base = match std::fs::File::open(&full) {
+                    Ok(f) => Base::File(f),
+                    // No local copy yet: a brand new file is entirely
+                    // `Literal`/`LiteralZ` ops, so an empty base is correct,
+                    // not a workaround.
+                    Err(_) => Base::Empty(std::io::Cursor::new(Vec::new())),
+                };
+                let mut writer = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+                let mut hasher = Sha256::new();
+
+                let mut received = 0u32;
+                while let Some(ops) = rx.blocking_recv() {
+                    binary::apply_ops_streaming(&mut base, block_size, &ops, &mut writer, &mut hasher)?;
+                    received += 1;
+                    if received == total {
+                        break;
+                    }
+                }
+                writer.flush()?;
+                drop(writer);
+
+                if received < total {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Ok(BinaryOutcome::Failed(format!(
+                        "connection closed after {received}/{total} chunks"
+                    )));
+                }
+                let got = hex::encode(hasher.finalize());
+                if got != hash {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Ok(BinaryOutcome::Failed(format!("reconstructed to {got} but peer said {hash}")));
+                }
+                let len = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+                Ok(BinaryOutcome::Verified { tmp, hash, len })
+            })();
+            let outcome = result.unwrap_or_else(|e| BinaryOutcome::Failed(e.to_string()));
+            let _ = ev_tx.send(Event::BinaryReceived {
+                from,
+                path: path_for_task,
                 version,
-            },
-        );
-        self.dirty = true;
-        println!("[recv] binary {path} ({} bytes) from {}", rebuilt.len(), format_id(from));
+                outcome,
+            });
+        });
+    }
 
-        // Relay the binary metadata to our other peers if the content actually changed.
-        // This allows peers not directly connected to the sender to discover and fetch the file.
+    /// A streamed reconstruction finished, one way or another.
+    fn on_binary_received(&mut self, from: PeerId, path: String, version: u64, outcome: BinaryOutcome) -> Result<()> {
+        // Whatever happens next, this transfer is no longer in flight — stop
+        // tracking it so a late chunk (a race, or a peer that kept sending
+        // after we'd already given up) has nowhere to go.
+        self.binary_recv.remove(&(from, path.clone()));
+
+        let (tmp, hash, len) = match outcome {
+            BinaryOutcome::Verified { tmp, hash, len } => (tmp, hash, len),
+            BinaryOutcome::Failed(reason) => {
+                eprintln!("[recv] {path} from {}: {reason}", format_id(from));
+                return Ok(());
+            }
+        };
+
+        let full = self.cfg.root.join(&path);
+        // Record our own hash before the rename lands, mirroring
+        // `write_file`, so the resulting filesystem event is recognized as
+        // our own echo rather than diffed back in as a local edit.
+        let list = self.self_writes.entry(full.clone()).or_default();
+        list.push((hash.clone(), Instant::now()));
+        if list.len() > 16 {
+            list.remove(0);
+        }
+        if let Err(e) = std::fs::rename(&tmp, &full) {
+            eprintln!("[recv] {path}: couldn't move reconstructed file into place: {e}");
+            let _ = std::fs::remove_file(&tmp);
+            return Ok(());
+        }
+
+        let version = version.max(self.state.bin.get(&path).map(|b| b.version).unwrap_or(0));
+        let hash_changed = self.state.bin.get(&path).map(|b| &b.hash) != Some(&hash);
+        self.state.bin.insert(path.clone(), BinEntry { hash: hash.clone(), len, version });
+        self.dirty = true;
+        println!("[recv] binary {path} ({len} bytes) from {}", format_id(from));
+
+        // Relay to our other peers if the content actually changed, so peers
+        // not directly connected to the sender still discover it.
         if hash_changed {
-            self.broadcast(
-                Msg::BinaryMeta {
-                    path: path.clone(),
-                    hash,
-                    len: rebuilt.len() as u64,
-                    version,
-                },
-                Some(from),
-            );
+            self.broadcast(Msg::BinaryMeta { path: path.clone(), hash, len, version }, Some(from));
         }
         Ok(())
     }
@@ -1253,7 +1477,6 @@ impl Engine {
     /// types. `to_vec_named` held all of it as one `Vec<u8>`.
     fn save_state(&mut self) {
         use serde::Serialize;
-        use std::io::Write;
 
         let p = self.state_path();
         let tmp = p.with_extension("tmp");
@@ -1287,22 +1510,26 @@ impl Engine {
         }
         for path in files {
             let Some(rel) = self.rel(&path) else { continue };
-            let Ok(bytes) = std::fs::read(&path) else { continue };
-            let hash = binary::sha256_hex(&bytes);
-            if binary::is_binary(&bytes) {
-                if self.state.bin.get(&rel).map(|b| b.hash.as_str()) != Some(hash.as_str()) {
-                    self.state.bin.insert(
-                        rel,
-                        BinEntry {
-                            hash,
-                            len: bytes.len() as u64,
-                            version: 1,
-                        },
-                    );
-                    self.dirty = true;
-                }
+            let is_binary = match binary::sniff_file(&path) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            if is_binary {
+                // Same reasoning as `on_touched`: don't read a multi-GB file
+                // into memory just to register that it exists. The hash lands
+                // a moment later via `Event::LocalBinaryHashed`, once the
+                // engine loop is already running — any peer that connects in
+                // that window still converges, just via the ordinary
+                // "new/changed file" broadcast instead of the startup manifest.
+                let tx = self.ev_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Ok((hash, len)) = binary::sha256_file(&path) {
+                        let _ = tx.send(Event::LocalBinaryHashed { rel, hash, len });
+                    }
+                });
                 continue;
             }
+            let Ok(bytes) = std::fs::read(&path) else { continue };
             let text = String::from_utf8_lossy(&bytes).to_string();
             match self.state.text.get_mut(&rel) {
                 // Restored state, but the file changed while we were down.
@@ -1329,6 +1556,33 @@ impl Engine {
 fn count_ops(ops: &[Op]) -> (usize, usize) {
     let ins = ops.iter().filter(|o| matches!(o, Op::Insert { .. })).count();
     (ins, ops.len() - ins)
+}
+
+/// The base a streamed binary reconstruction reads matched blocks from: the
+/// receiver's own current file, seeked into rather than loaded whole, or an
+/// empty in-memory stand-in when there is no local copy yet (a brand new
+/// file, entirely literal bytes).
+enum Base {
+    File(std::fs::File),
+    Empty(std::io::Cursor<Vec<u8>>),
+}
+
+impl Read for Base {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Base::File(f) => f.read(buf),
+            Base::Empty(c) => c.read(buf),
+        }
+    }
+}
+
+impl Seek for Base {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        match self {
+            Base::File(f) => f.seek(pos),
+            Base::Empty(c) => c.seek(pos),
+        }
+    }
 }
 
 pub fn format_id(id: PeerId) -> String {
@@ -1574,7 +1828,7 @@ async fn pump(
             if binding.is_none() {
                 eprintln!(
                     "[auth] {} authenticated over plaintext: authorized, but not protected \
-                     against an active man-in-the-middle. Add --tls.",
+                     against an active man-in-the-middle. Drop --insecure to encrypt this link.",
                     format_id(peer_id)
                 );
             }
@@ -1608,7 +1862,22 @@ async fn pump(
 
     // Read until the peer goes away or the engine shuts down.
     while let Ok(msg) = read_msg(&mut rd).await {
-        if ev_tx.send(Event::Msg { from: peer_id, msg }).is_err() {
+        if let Msg::BinaryDeltaChunk { .. } = &msg {
+            // Wait for the engine to hand this chunk off to its writer task
+            // before reading the next frame. Without this, a fast sender (or
+            // just loopback, where a multi-hundred-MB transfer arrives
+            // essentially all at once) reads every chunk off the socket long
+            // before the single-threaded engine loop processes the first one
+            // — the chunking exists so the receiver never buffers more than
+            // one chunk's worth of a transfer, and that bound is only real if
+            // reading from the network is throttled to match how fast the
+            // engine (in turn throttled by disk write speed) can keep up.
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            if ev_tx.send(Event::BinaryChunk { from: peer_id, msg, ack: ack_tx }).is_err() {
+                break;
+            }
+            let _ = ack_rx.await;
+        } else if ev_tx.send(Event::Msg { from: peer_id, msg }).is_err() {
             break;
         }
     }

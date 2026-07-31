@@ -22,7 +22,7 @@
 //! own certificate to the dialing peer while speaking to the real listener as a
 //! client. The two ends then hash different certificates, the MACs disagree, and
 //! both connections are dropped. Over plaintext there is no certificate to bind
-//! to, so `--secret` without `--tls` gets authorization only, and we say so.
+//! to, so `--secret` with `--insecure` gets authorization only, and we say so.
 
 use anyhow::{bail, Result};
 use hmac::{Hmac, Mac};

@@ -156,6 +156,53 @@ async fn binary_file_syncs_and_deltas() {
     expect_bytes(&b.path().join("image.bin"), &blob, T).await;
 }
 
+/// A file big enough that its first-sync delta (entirely literal — there is
+/// nothing on the other side to diff against yet) has to cross
+/// `wire::DELTA_CHUNK_TARGET` several times over. This is the exact scenario
+/// that used to be a hard failure: a delta that didn't fit in one
+/// `wire::MAX_FRAME` message never sent at all. It now streams as multiple
+/// `BinaryDeltaChunk` messages and reassembles on a background writer that
+/// never holds the whole file in memory at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn large_binary_file_crosses_multiple_wire_chunks() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    spawn_peer(a.path().to_path_buf(), 91, 17901, vec![]);
+    spawn_peer(b.path().to_path_buf(), 92, 17902, vec!["127.0.0.1:17901".into()]);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // Genuinely random, not just varied: compressible content would collapse
+    // into fewer, smaller chunks and undersell what this test is checking.
+    let mut x = 0x9E3779B97F4A7C15u64;
+    let mut rnd = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let mut blob = vec![0u8; 10 << 20]; // 10 MB: a couple multiples of the 4 MB chunk target
+    for chunk in blob.chunks_mut(8) {
+        chunk.copy_from_slice(&rnd().to_le_bytes()[..chunk.len()]);
+    }
+    blob[0] = 0; // keep it off the text path regardless of what the random bytes spell
+
+    // Generous timeout: this is the only test in the suite moving megabytes,
+    // and the whole suite's e2e tests run their own tokio runtimes
+    // concurrently, so a slow CI box under full parallel load is competing
+    // for the same cores as everything else — this should not imply a race
+    // with real-world timing the way the content-correctness checks do.
+    let big = Duration::from_secs(45);
+    std::fs::write(a.path().join("movie.bin"), &blob).unwrap();
+    expect_bytes(&b.path().join("movie.bin"), &blob, big).await;
+
+    // A change against a 10 MB base: proves the receiving side's streamed
+    // reconstruction correctly seeks into its *own* large file for `CopyBlock`
+    // ops, not just that a big pile of `Literal` bytes lands intact.
+    blob[5 << 20] ^= 0xff;
+    std::fs::write(a.path().join("movie.bin"), &blob).unwrap();
+    expect_bytes(&b.path().join("movie.bin"), &blob, big).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn deletes_propagate() {
     let a = tempfile::tempdir().unwrap();
