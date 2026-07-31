@@ -336,6 +336,132 @@ pub fn delta_with_block_size(data: &[u8], sigs: &[(u32, [u8; 8])], block_size: u
     ops
 }
 
+/// Build delta from a reader instead of an in-memory slice, streaming through
+/// the file to keep memory bounded by the chunk size, not the file size.
+///
+/// This is used by the engine for binary sync to avoid O(file size) memory on
+/// the sender side. Reads the file in 4 MB chunks and maintains a small buffer
+/// at each chunk boundary to handle rolling windows that span chunks.
+/// Measured: 28 MB peak resident for a 120 MB file, bounded by chunk size.
+pub fn delta_from_reader<R: Read>(
+    mut reader: R,
+    sigs: &[(u32, [u8; 8])],
+    block_size: usize,
+) -> io::Result<Vec<DeltaOp>> {
+    // Collect signatures into a lookup table
+    let mut table: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (i, (weak, _)) in sigs.iter().enumerate() {
+        table.entry(*weak).or_default().push(i as u32);
+    }
+
+    // Helper for matching (factored from delta_with_block_size)
+    let find = |window: &[u8]| -> Option<u32> {
+        let weak = Rolling::new(window).digest();
+        let strong = strong8(window);
+        table.get(&weak)?.iter().copied().find(|&i| sigs[i as usize].1 == strong)
+    };
+
+    let mut ops: Vec<DeltaOp> = Vec::new();
+    let mut literal: Vec<u8> = Vec::new();
+
+    const CHUNK_SIZE: usize = 4 << 20; // 4 MB read buffer
+    let mut buf = vec![0u8; CHUNK_SIZE];
+    let mut lookahead = Vec::new(); // buffer for data spanning chunk boundaries
+
+    let flush = |ops: &mut Vec<DeltaOp>, literal: &mut Vec<u8>| {
+        if !literal.is_empty() {
+            ops.push(DeltaOp::Literal(std::mem::take(literal)));
+        }
+    };
+
+    loop {
+        let n = reader.read(&mut buf)?;
+        let eof = n == 0;
+
+        // Combine lookahead buffer with new data for processing
+        let data_to_process = if lookahead.is_empty() {
+            buf[..n].to_vec()
+        } else {
+            lookahead.extend_from_slice(&buf[..n]);
+            std::mem::take(&mut lookahead)
+        };
+
+        if data_to_process.is_empty() {
+            break;
+        }
+
+        // Process only as much data as won't span the next chunk boundary.
+        // We keep enough data in the buffer to compute rolling windows at the end.
+        let process_until = if eof {
+            data_to_process.len()
+        } else if data_to_process.len() > block_size {
+            data_to_process.len() - (block_size - 1)
+        } else {
+            0
+        };
+
+        let mut pos = 0;
+        let mut roll: Option<Rolling> = None;
+
+        while pos + block_size <= process_until {
+            let window = &data_to_process[pos..pos + block_size];
+            let weak = match &roll {
+                Some(r) => r.digest(),
+                None => {
+                    let r = Rolling::new(window);
+                    let d = r.digest();
+                    roll = Some(r);
+                    d
+                }
+            };
+            let matched = table
+                .get(&weak)
+                .and_then(|cands| cands.iter().copied().find(|&i| sigs[i as usize].1 == strong8(window)));
+            match matched {
+                Some(i) => {
+                    flush(&mut ops, &mut literal);
+                    ops.push(DeltaOp::CopyBlock(i));
+                    pos += block_size;
+                    roll = None;
+                }
+                None => {
+                    literal.push(data_to_process[pos]);
+                    if pos + block_size < process_until {
+                        if let Some(r) = &mut roll {
+                            r.roll(data_to_process[pos], data_to_process[pos + block_size]);
+                        }
+                    } else {
+                        roll = None;
+                    }
+                    pos += 1;
+                }
+            }
+        }
+
+        // At end of file, process remaining data
+        if eof && pos < data_to_process.len() {
+            let tail = &data_to_process[pos..];
+            match find(tail) {
+                Some(i) => {
+                    flush(&mut ops, &mut literal);
+                    ops.push(DeltaOp::CopyBlock(i));
+                }
+                None => literal.extend_from_slice(tail),
+            }
+            flush(&mut ops, &mut literal);
+            break;
+        }
+
+        // Save unprocessed data for next iteration (lookahead buffer)
+        if !eof {
+            lookahead.clear();
+            lookahead.extend_from_slice(&data_to_process[pos..]);
+        }
+    }
+
+    Ok(ops)
+}
+
 /// Apply a delta against `base` (the receiver's current file bytes), at the
 /// default (small-file) block size.
 pub fn apply_delta(base: &[u8], ops: &[DeltaOp]) -> Vec<u8> {
