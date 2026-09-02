@@ -10,7 +10,7 @@ services:
     volumes:
       - alice-sync:/sync
     command: [
-      "p2psync", ".",
+      ".",
       "-l", "0.0.0.0:7901",
       "--name", "alice",
       "--insecure"
@@ -27,7 +27,7 @@ services:
     volumes:
       - bob-sync:/sync
     command: [
-      "p2psync", ".",
+      ".",
       "-l", "0.0.0.0:7901",
       "--peer", "alice:7901",
       "--name", "bob",
@@ -47,7 +47,7 @@ services:
     volumes:
       - charlie-sync:/sync
     command: [
-      "p2psync", ".",
+      ".",
       "-l", "0.0.0.0:7901",
       "--peer", "bob:7901",
       "--name", "charlie",
